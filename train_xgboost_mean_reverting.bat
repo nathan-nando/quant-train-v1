@@ -1,11 +1,10 @@
 @echo off
 setlocal
 
-:: Berpindah ke folder quant-engine-v1 karena virtual environment ada di sana
 cd /d "%~dp0\..\quant-engine-v1"
 
 echo ==============================================
-echo     QUANT-V1 XGBOOST LOCAL TRAINING        
+echo     QUANT-V1 XGBOOST MEAN REVERTING TRAINING        
 echo ==============================================
 echo Mengaktifkan Virtual Environment...
 if exist ".venv\Scripts\activate.bat" (
@@ -23,7 +22,7 @@ python -m pip install xgboost scikit-learn pandas onnx onnxmltools onnxconverter
 echo.
 echo Memulai proses pelatihan AI...
 echo.
-python "..\quant-train-v1\notebooks\xgboost\train_xgboost.py"
+python "..\quant-train-v1\notebooks\xgboost\mean_reverting\train_xgboost_mean_reverting.py"
 
 :end
 echo.
