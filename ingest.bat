@@ -25,7 +25,11 @@ set /p count="Enter total rows to pull (e.g. 10000): "
 set /p tf="Enter timeframe (e.g. H1, M15) [Press Enter for H1]: "
 if "%tf%"=="" set tf=H1
 echo Running ingestion...
-call venv\Scripts\activate.bat
+if exist ".venv\Scripts\activate.bat" (
+    call .venv\Scripts\activate.bat
+) else (
+    call venv\Scripts\activate.bat
+)
 python scripts\ingest_historical.py --count %count% --timeframe %tf%
 goto end
 
@@ -35,7 +39,11 @@ set /p end_date="Enter end date (YYYY-MM-DD): "
 set /p tf="Enter timeframe (e.g. H1, M15) [Press Enter for H1]: "
 if "%tf%"=="" set tf=H1
 echo Running ingestion...
-call venv\Scripts\activate.bat
+if exist ".venv\Scripts\activate.bat" (
+    call .venv\Scripts\activate.bat
+) else (
+    call venv\Scripts\activate.bat
+)
 python scripts\ingest_historical.py --start %start_date% --end %end_date% --timeframe %tf%
 goto end
 
