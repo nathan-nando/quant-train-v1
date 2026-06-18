@@ -1,48 +1,38 @@
-# Quant-Train-V1
+# Quant Train V1 (Pusat Pelatihan & Ingestion)
 
-Quant-Train-V1 adalah lingkungan pelatihan (Training Environment) khusus untuk proyek Algorithmic Trading Quant-V1. Repositori ini difokuskan sepenuhnya untuk pengumpulan data historis (ingestion), penelitian (research), dan pelatihan Alpha Model (Machine Learning).
+`quant-train-v1` adalah lingkungan laboratorium khusus untuk *data ingestion*, riset, dan *hyperparameter tuning* Model *Machine Learning* untuk keluarga algoritma Quant-V1.
 
-Proyek ini sengaja dipisahkan dari `quant-engine-v1` (Backend/Sistem Saraf) dan `quant-dashboard-v1` (Frontend/Portal) agar proses *data science* tidak mengganggu sistem eksekusi *live trading*.
+Sistem pelatihan ini didesain independen secara penyimpanan agar tidak membebani eksekusi transaksi di pasar nyata, namun sepenuhnya terintegrasi sehingga prosesnya dapat dikendalikan dari jarak jauh melalui **Quant Dashboard V1**.
 
-## 🚀 Fitur Utama
+## 🚀 Pipa Pelatihan Otomatis (Auto-Tuning Pipeline)
 
-- **Data Ingestion Otomatis:** Skrip penarikan data OHLCV langsung dari MetaTrader 5 yang telah dilengkapi dengan injeksi fitur teknikal (*RSI, MACD, ATR, OBV* dll).
-- **Fleksibilitas Pengambilan:** Mendukung penarikan data berdasarkan jumlah baris (misal: 50.000 baris ke belakang) atau rentang waktu historis (misal: `2020-01-01` sampai `2023-12-31`).
-- **Sistem Kapsul Versi (Versioning):** Setiap penarikan data akan membuat satu direktori kapsul unik yang berisi kumpulan `dataset` (CSV) dan folder `model` yang siap digunakan, memastikan hasil pelatih model ML tidak saling tindih.
+Sistem telah dielevasi untuk menggunakan format *XGBoost Ensemble*, yang memecah pembelajaran menjadi 3 langkah berurutan:
+1. **Pemilahan Data:** Memfilter *dataset* CSV berdasarkan kriteria *Market Regime* yang dituju (misal: `TREND_BULL`).
+2. **Tuning Classifier (Arah):** Menjalankan studi **Optuna** secara otomatis guna menemukan pohon keputusan optimal penentu arah tren (Buy/Sell/Hold).
+3. **Tuning SL & TP Regressors (Batas Harga):** Melatih dua *regressor* tambahan untuk memprediksi probabilitas batas terburuk (*Stop Loss*/MAE) dan kemungkinan lonjakan terbaik (*Take Profit*/MFE).
+4. **ONNX Export:** Ketiga model di atas langsung diekspor dari memori ke dalam format `.onnx` yang ringan, cepat dieksekusi, dan terstandarisasi.
+5. **Registrasi MLflow & Database:** Secara mandiri mencatat *metric accuracy/loss*, argumen model ke *local* **MLflow** backend, menghasilkan file PDF laporan, dan mendaftarkannya via HTTP POST ke Registry `quant-engine-v1`.
 
-## 📁 Struktur Direktori Otomatis
-
-Setiap kali Anda menjalankan skrip *ingestion*, sistem akan menghasilkan struktur versi seperti ini:
+## 📁 Struktur Direktori
 
 ```text
 quant-train-v1/
-├── ingest.bat                          # Pelatuk utama penarik data (Windows)
-├── README.md                           # Penjelasan repositori
-└── {TIMEFRAME}_{OPTION}_{TIMESTAMP}/   # Contoh: H1_50000rows_20260617_161500
-    ├── dataset/
-    │   └── XAUUSD_H1_features.csv      # File dataset hasil ekstraksi siap pakai
-    └── model/                          # (Kosong) Tempat Anda menyimpan model (.pkl / .joblib)
+├── dataset/                    # Rumah bagi CSV hasil injeksi fitur (MACD, ATR, EMA, dll)
+├── mlflow/                     # Penyimpanan backend MLflow untuk catatan trials
+├── notebooks/
+│   └── xgboost/                # Titik kumpul skrip engine tuning (seperti: train_xgboost_bull_trend.py)
+└── ingest.bat                  # Utilitas Windows untuk menarik data baris per baris dari MT5
 ```
 
-## 🛠️ Cara Penggunaan (Data Ingestion)
+## 🛠️ Cara Penggunaan
 
-Pastikan Anda sudah menjalankan MetaTrader 5 di mesin Anda, kemudian:
+### Opsi 1: Mode Dashboard (Otomatis & Real-time)
+Pelatihan kini terintegrasi secara modular. Buka antarmuka web (Quant Dashboard V1) pada menu **Models -> Train**.
+Proses inisialisasi, *loop trials* Optuna, serta konfirmasi penyelesaian akan muncul secara langsung (*streaming*) ke browser.
 
-1. Buka *Command Prompt* atau *PowerShell*
-2. Masuk ke direktori `quant-train-v1`
-3. Jalankan berkas *batch* interaktif:
-   ```cmd
-   ingest.bat
-   ```
-4. Ikuti instruksi interaktif yang muncul di layar:
-   - Pilih mode `Total Row` (Jumlah Baris) atau `Date Range` (Rentang Waktu).
-   - Masukkan *Timeframe* yang Anda inginkan (tekan *Enter* untuk *default* `H1`).
-5. Selesai! Kapsul versi baru Anda siap digunakan untuk pelatihan model.
-
-## 🧠 Langkah Selanjutnya (Data Science)
-
-1. Buat berkas *Jupyter Notebook* (`.ipynb`) atau *Python script* Anda di dalam folder versi spesifik yang baru terbentuk.
-2. Muat (*load*) file `.csv` dari sub-folder `dataset/`.
-3. Latih model *Machine Learning* Anda (XGBoost, Random Forest, LSTM, dll).
-4. Simpan model final (*dump*) ke dalam sub-folder `model/`.
-5. Pindahkan model yang sudah matang dari folder `model/` ke dalam `quant-engine-v1/app/services/alpha_engine.py` untuk dihidupkan di pasar nyata!
+### Opsi 2: Mode CLI (Manual Tuning)
+Jika Anda butuh iterasi *hyperparameter* tertentu tanpa campur tangan API, pastikan Anda memiliki *dataset* yang matang (`ingest.bat`), lalu jalankan:
+```cmd
+python notebooks/xgboost/bull_trend/train_xgboost_bull_trend.py --optuna_trials 15 --model_name xgboost_my_custom_v1
+```
+Model ONNX akan dicetak dan dimasukkan ke dalam arsip pendaftaran tanpa perlu dipindahkan secara manual.
