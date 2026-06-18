@@ -2,7 +2,7 @@
 setlocal
 
 :: Navigate to the engine directory since the python script lives there
-cd /d "%~dp0\..\quant-engine-v1"
+cd /d "%~dp0\..\..\quant-engine-v1"
 
 echo ==============================================
 echo     QUANT-V1 HISTORICAL DATA INGESTION        

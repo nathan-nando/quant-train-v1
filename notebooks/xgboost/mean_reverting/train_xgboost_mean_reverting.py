@@ -1,3 +1,8 @@
+import uuid
+import requests
+run_id = str(uuid.uuid4())[:6]
+
+
 import pandas as pd
 import numpy as np
 import os
@@ -11,7 +16,21 @@ import onnx
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import json
+import optuna
 import warnings
+import argparse
+import time
+from datetime import datetime
+
+train_start_time = datetime.utcnow().isoformat()
+start_time_ts = time.time()
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--optuna_trials', type=int, default=10)
+parser.add_argument('--model_name', type=str, default=None)
+args = parser.parse_args()
+model_prefix = args.model_name if args.model_name else f'xgboost_mean_reverting_{run_id}'
+
 warnings.filterwarnings('ignore')
 
 print("=========================================")
@@ -20,14 +39,14 @@ print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 train_dir = os.path.abspath(os.path.join(base_dir, "..", "..", ".."))
-dataset_pattern = os.path.join(train_dir, "*", "dataset", "XAUUSD_H1_features.csv")
-list_of_files = glob.glob(dataset_pattern)
+csv_path = os.path.join(train_dir, "dataset", "XAUUSD_H1_features.csv")
 
-if not list_of_files:
+
+if not os.path.exists(csv_path):
     print("Error: Dataset XAUUSD_H1_features.csv tidak ditemukan!")
     exit(1)
 
-csv_path = max(list_of_files, key=os.path.getctime)
+
 print(f"Dataset Ditemukan:\n{csv_path}\n")
 
 df = pd.read_csv(csv_path)
@@ -43,7 +62,7 @@ else:
 df = df.sort_values('time').reset_index(drop=True)
 
 N_BARS = 3
-THRESHOLD = 0.0015
+THRESHOLD = 0.0030
 df['future_return'] = (df['close'].shift(-N_BARS) - df['close']) / df['close']
 
 conditions = [
@@ -82,25 +101,83 @@ X_all = X_all.astype(np.float32)
 
 y_cls = df['target'].map({-1: 0, 0: 1, 1: 2})
 
-print("\n[1/3] Melatih CLASSIFIER...")
+print("\nPROGRESS: 40% - Tuning Classifier...\n[1/3] Melatih CLASSIFIER...")
 tscv = TimeSeriesSplit(n_splits=5)
-cls_model = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=42, eval_metric='mlogloss', n_jobs=-1)
+
+def cls_objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+        'max_depth': trial.suggest_int('max_depth', 3, 7),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+    }
+    model = XGBClassifier(**params, random_state=42, eval_metric='mlogloss', n_jobs=-1)
+    scores = []
+    for train_index, test_index in tscv.split(X_all):
+        X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
+        y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
+        model.fit(X_train.values, y_train)
+        scores.append(accuracy_score(y_test, model.predict(X_test.values)))
+    return np.mean(scores)
+
+print("Starting Optuna Study for CLASSIFIER...")
+cls_study = optuna.create_study(direction='maximize')
+cls_study.optimize(cls_objective, n_trials=args.optuna_trials)
+best_cls_params = cls_study.best_params
+print(f"Best Classifier Params: {best_cls_params}")
+
+cls_model = XGBClassifier(**best_cls_params, random_state=42, eval_metric='mlogloss', n_jobs=-1)
 
 acc_last = 0
+report_dict = {}
 for train_index, test_index in tscv.split(X_all):
     X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
     y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
     cls_model.fit(X_train.values, y_train)
-    acc_last = accuracy_score(y_test, cls_model.predict(X_test.values))
+    y_pred = cls_model.predict(X_test.values)
+    acc_last = accuracy_score(y_test, y_pred)
+    report_dict = classification_report([str(x) for x in y_test], [str(x) for x in y_pred], output_dict=True)
+
 print(f"Classifier Akurasi Akhir: {acc_last:.4f}")
+print("Retraining CLASSIFIER on full dataset...")
+cls_model.fit(X_all.values, y_cls)
 
 df_trend = df[df['target'] != 0].copy()
 X_trend = df_trend.drop(columns=fitur_kategori).astype(np.float32)
 y_sl = df_trend['sl_pips']
 y_tp = df_trend['tp_pips']
 
-print("\n[2/3] Melatih SL REGRESSOR...")
-sl_model = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, n_jobs=-1)
+print("\nPROGRESS: 60% - Tuning SL Regressor...\n[2/3] Melatih SL REGRESSOR...")
+def sl_objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+        'max_depth': trial.suggest_int('max_depth', 3, 7),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+    }
+    model = XGBRegressor(**params, random_state=42, n_jobs=-1)
+    scores = []
+    if len(X_trend) > 20:
+        for train_index, test_index in tscv.split(X_trend):
+            X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
+            y_train, y_test = y_sl.iloc[train_index], y_sl.iloc[test_index]
+            model.fit(X_train.values, y_train)
+            scores.append(mean_absolute_error(y_test, model.predict(X_test.values)))
+        return np.mean(scores)
+    return 999.0
+
+if len(X_trend) > 20:
+    print("Starting Optuna Study for SL REGRESSOR...")
+    sl_study = optuna.create_study(direction='minimize')
+    sl_study.optimize(sl_objective, n_trials=args.optuna_trials)
+    best_sl_params = sl_study.best_params
+    print(f"Best SL Regressor Params: {best_sl_params}")
+else:
+    best_sl_params = {'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05}
+
+sl_model = XGBRegressor(**best_sl_params, random_state=42, n_jobs=-1)
 if len(X_trend) > 20:
     for train_index, test_index in tscv.split(X_trend):
         X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
@@ -108,12 +185,42 @@ if len(X_trend) > 20:
         sl_model.fit(X_train.values, y_train)
         mae_sl = mean_absolute_error(y_test, sl_model.predict(X_test.values))
     print(f"SL MAE Akhir: {mae_sl:.4f} pips")
+    print("Retraining SL REGRESSOR on full dataset...")
+    sl_model.fit(X_trend.values, y_sl)
 else:
     sl_model.fit(X_trend.values, y_sl)
     mae_sl = 0
 
-print("\n[3/3] Melatih TP REGRESSOR...")
-tp_model = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, n_jobs=-1)
+print("\nPROGRESS: 80% - Tuning TP Regressor...\n[3/3] Melatih TP REGRESSOR...")
+def tp_objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+        'max_depth': trial.suggest_int('max_depth', 3, 7),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+    }
+    model = XGBRegressor(**params, random_state=42, n_jobs=-1)
+    scores = []
+    if len(X_trend) > 20:
+        for train_index, test_index in tscv.split(X_trend):
+            X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
+            y_train, y_test = y_tp.iloc[train_index], y_tp.iloc[test_index]
+            model.fit(X_train.values, y_train)
+            scores.append(mean_absolute_error(y_test, model.predict(X_test.values)))
+        return np.mean(scores)
+    return 999.0
+
+if len(X_trend) > 20:
+    print("Starting Optuna Study for TP REGRESSOR...")
+    tp_study = optuna.create_study(direction='minimize')
+    tp_study.optimize(tp_objective, n_trials=args.optuna_trials)
+    best_tp_params = tp_study.best_params
+    print(f"Best TP Regressor Params: {best_tp_params}")
+else:
+    best_tp_params = {'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05}
+
+tp_model = XGBRegressor(**best_tp_params, random_state=42, n_jobs=-1)
 if len(X_trend) > 20:
     for train_index, test_index in tscv.split(X_trend):
         X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
@@ -121,6 +228,8 @@ if len(X_trend) > 20:
         tp_model.fit(X_train.values, y_train)
         mae_tp = mean_absolute_error(y_test, tp_model.predict(X_test.values))
     print(f"TP MAE Akhir: {mae_tp:.4f} pips")
+    print("Retraining TP REGRESSOR on full dataset...")
+    tp_model.fit(X_trend.values, y_tp)
 else:
     tp_model.fit(X_trend.values, y_tp)
     mae_tp = 0
@@ -133,14 +242,14 @@ onnx_sl = onnxmltools.convert_xgboost(sl_model, initial_types=initial_type)
 onnx_tp = onnxmltools.convert_xgboost(tp_model, initial_types=initial_type)
 
 engine_dir = os.path.abspath(os.path.join(train_dir, "..", "quant-engine-v1", "ml_models", "mean_reverting"))
-kapsul_dir = os.path.abspath(os.path.join(os.path.dirname(csv_path), "..", "model", "mean_reverting"))
+kapsul_dir = os.path.abspath(os.path.join(train_dir, "mlflow", "models", "mean_reverting"))
 os.makedirs(engine_dir, exist_ok=True)
 os.makedirs(kapsul_dir, exist_ok=True)
 
 names = [
-    ('xgboost_mean_reverting.onnx', onnx_cls),
-    ('xgboost_mean_reverting_sl.onnx', onnx_sl),
-    ('xgboost_mean_reverting_tp.onnx', onnx_tp)
+    (f'{model_prefix}.onnx', onnx_cls),
+    (f'{model_prefix}_sl.onnx', onnx_sl),
+    (f'{model_prefix}_tp.onnx', onnx_tp)
 ]
 
 for filename, model_onnx in names:
@@ -157,23 +266,26 @@ for col in X_all.columns:
     }
 
 metadata = {
-    "model_name": "xgboost_mean_reverting",
+    "model_name": model_prefix,
     "features": list(X_all.columns),
     "classes": {0: "SELL", 1: "NEUTRAL", 2: "BUY"},
     "baseline_stats": stats
 }
-with open(os.path.join(engine_dir, 'xgboost_mean_reverting_metadata.json'), 'w') as f:
+with open(os.path.join(engine_dir, f'{model_prefix}_metadata.json'), 'w') as f:
     json.dump(metadata, f, indent=4)
-with open(os.path.join(kapsul_dir, 'xgboost_mean_reverting_metadata.json'), 'w') as f:
+with open(os.path.join(kapsul_dir, f'{model_prefix}_metadata.json'), 'w') as f:
     json.dump(metadata, f, indent=4)
 
-pdf_path = os.path.join(kapsul_dir, 'xgboost_mean_reverting_report.pdf')
+pdf_path = os.path.join(kapsul_dir, f'{model_prefix}_report.pdf')
 with PdfPages(pdf_path) as pdf:
     plt.figure(figsize=(8.5, 11))
     plt.axis('off')
     report_text = f"ENSEMBLE REPORT: MEAN REVERTING\n"
     report_text += "="*40 + "\n"
     report_text += f"Classifier Acc : {acc_last:.4f}\n"
+    report_text += f"Precision (SELL): {report_dict.get('0', {}).get('precision', 0.0):.4f}\n"
+    report_text += f"Precision (BUY) : {report_dict.get('2', {}).get('precision', 0.0):.4f}\n"
+    report_text += f"Best Params (Cls): {best_cls_params}\n"
     if len(X_trend) > 20:
         report_text += f"SL Regressor MAE: {mae_sl:.4f} pips\n"
         report_text += f"TP Regressor MAE: {mae_tp:.4f} pips\n"
@@ -189,4 +301,68 @@ with PdfPages(pdf_path) as pdf:
     pdf.savefig()
     plt.close()
 
+
+# ==========================================
+# MLFLOW TRACKING
+# ==========================================
+import os
+os.environ['MLFLOW_ALLOW_FILE_STORE'] = 'true'
+import mlflow
+
+mlflow.set_tracking_uri("file:///c:/code/quant-v1/quant-train-v1/mlflow")
+mlflow.set_experiment("XAUUSD_H1_mean_reverting")
+
+with mlflow.start_run(run_name="Optuna_Auto_Tuning"):
+    # Log parameters
+    mlflow.log_params({"cls_" + k: v for k, v in best_cls_params.items()})
+    mlflow.log_params({"sl_" + k: v for k, v in best_sl_params.items()})
+    mlflow.log_params({"tp_" + k: v for k, v in best_tp_params.items()})
+    
+    # Log metrics
+    mlflow.log_metric("cls_accuracy", acc_last)
+    if 'mae_sl' in locals():
+        mlflow.log_metric("sl_mae", mae_sl)
+        mlflow.log_metric("tp_mae", mae_tp)
+        
+    # Log artifacts
+    mlflow.log_artifact(os.path.join(kapsul_dir, f'{model_prefix}.onnx'))
+    mlflow.log_artifact(os.path.join(kapsul_dir, f'{model_prefix}_sl.onnx'))
+    mlflow.log_artifact(os.path.join(kapsul_dir, f'{model_prefix}_tp.onnx'))
+    mlflow.log_artifact(os.path.join(kapsul_dir, f'{model_prefix}_metadata.json'))
+    mlflow.log_artifact(pdf_path)
+    
+print("\n[MLFlow] Run recorded successfully!")
 print(f"\nSUKSES! 3 Model ONNX untuk Mean Reverting telah dibuat dan disimpan di direktori mean_reverting.")
+
+# Auto-register to Engine Database
+try:
+    print("\n[Registry] Mendaftarkan model ke Engine...")
+    train_duration_sec = str(int(time.time() - start_time_ts))
+    
+    try:
+        report_str = json.dumps(report_dict)
+    except:
+        report_str = "{}"
+        
+    try:
+        hyper_str = json.dumps({"cls": best_cls_params, "sl": best_sl_params, "tp": best_tp_params})
+    except:
+        hyper_str = "{}"
+
+    payload = {
+        "name": model_prefix,
+        "algorithm_type": "XGBoost Ensemble",
+        "accuracy": f"{acc_last*100:.2f}%",
+        "status": "Inactive",
+        "train_start_time": train_start_time,
+        "train_duration_sec": train_duration_sec,
+        "metrics_report": report_str,
+        "hyperparameters": hyper_str
+    }
+    res = requests.post("http://127.0.0.1:8000/api/models/", json=payload)
+    if res.status_code == 200:
+        print(f"[Registry] Berhasil mendaftarkan {model_prefix} ke Dashboard!")
+    else:
+        print(f"[Registry] Gagal mendaftar: {res.text}")
+except Exception as e:
+    print(f"[Registry] Gagal terhubung ke API Engine: {e}")

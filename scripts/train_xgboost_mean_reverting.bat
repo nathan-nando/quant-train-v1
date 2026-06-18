@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-cd /d "%~dp0\..\quant-engine-v1"
+cd /d "%~dp0\..\..\quant-engine-v1"
 
 echo ==============================================
 echo     QUANT-V1 XGBOOST MEAN REVERTING TRAINING        
@@ -18,6 +18,11 @@ if exist ".venv\Scripts\activate.bat" (
 
 echo Memeriksa dan memasang pustaka Machine Learning...
 python -m pip install xgboost scikit-learn pandas onnx onnxmltools onnxconverter-common matplotlib --quiet
+
+echo.
+echo.
+echo Menarik data harga terbaru (Live) dari MT5...
+python scripts\ingest_historical.py --count 10000 --timeframe H1
 
 echo.
 echo Memulai proses pelatihan AI...

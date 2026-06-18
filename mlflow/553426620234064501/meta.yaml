@@ -1,0 +1,9 @@
+artifact_location: file:///c:/code/quant-v1/quant-train-v1/mlflow/553426620234064501
+creation_time: 1781773412087
+effective_trace_archival_retention: null
+experiment_id: '553426620234064501'
+last_update_time: 1781773412087
+lifecycle_stage: active
+name: XAUUSD_H1_bull_trend
+trace_location: null
+workspace: default
