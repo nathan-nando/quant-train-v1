@@ -1,9 +1,0 @@
-artifact_location: file:///c:/code/quant-v1/quant-train-v1/mlruns/295131167266714025
-creation_time: 1781765712723
-effective_trace_archival_retention: null
-experiment_id: '295131167266714025'
-last_update_time: 1781765712723
-lifecycle_stage: active
-name: XAUUSD_H1_bear_trend
-trace_location: null
-workspace: default

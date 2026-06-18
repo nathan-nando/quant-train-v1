@@ -308,9 +308,16 @@ with PdfPages(pdf_path) as pdf:
 import os
 os.environ['MLFLOW_ALLOW_FILE_STORE'] = 'true'
 import mlflow
+from mlflow.exceptions import MlflowException
 
 mlflow.set_tracking_uri("file:///c:/code/quant-v1/quant-train-v1/mlflow")
-mlflow.set_experiment("XAUUSD_H1_bear_trend")
+try:
+    mlflow.set_experiment("XAUUSD_H1_bear_trend")
+except MlflowException:
+    experiment = mlflow.get_experiment_by_name("XAUUSD_H1_bear_trend")
+    if experiment and experiment.lifecycle_stage == 'deleted':
+        mlflow.tracking.MlflowClient().restore_experiment(experiment.experiment_id)
+        mlflow.set_experiment("XAUUSD_H1_bear_trend")
 
 with mlflow.start_run(run_name="Optuna_Auto_Tuning"):
     # Log parameters
@@ -357,7 +364,8 @@ try:
         "train_start_time": train_start_time,
         "train_duration_sec": train_duration_sec,
         "metrics_report": report_str,
-        "hyperparameters": hyper_str
+        "hyperparameters": hyper_str,
+        "metadata": json.dumps(metadata)
     }
     res = requests.post("http://127.0.0.1:8000/api/models/", json=payload)
     if res.status_code == 200:

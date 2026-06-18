@@ -1,0 +1,14 @@
+artifact_uri: file:///c:/code/quant-v1/quant-train-v1/mlflow/842890115684721083/5748c12833d340849472e0ba11e24ca0/artifacts
+end_time: 1781784181085
+entry_point_name: ''
+experiment_id: '842890115684721083'
+lifecycle_stage: active
+run_id: 5748c12833d340849472e0ba11e24ca0
+run_name: Optuna_Auto_Tuning
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1781784180806
+status: 3
+tags: []
+user_id: lumba
