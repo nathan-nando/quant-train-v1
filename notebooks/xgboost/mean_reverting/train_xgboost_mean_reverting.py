@@ -29,6 +29,7 @@ start_time_ts = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument('--optuna_trials', type=int, default=10)
 parser.add_argument('--model_name', type=str, default=None)
+parser.add_argument('--dataset_file', type=str, default='XAUUSDm_H1_features.csv')
 args = parser.parse_args()
 model_prefix = args.model_name if args.model_name else f'xgboost_mean_reverting_{run_id}'
 
@@ -40,7 +41,7 @@ print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 train_dir = os.path.abspath(os.path.join(base_dir, "..", "..", ".."))
-csv_path = os.path.join(train_dir, "dataset", "XAUUSDm_H1_features.csv")
+csv_path = os.path.join(train_dir, "dataset", args.dataset_file)
 
 
 if not os.path.exists(csv_path):
