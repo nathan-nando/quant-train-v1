@@ -1,8 +1,9 @@
 artifact_uri: file:///c:/code/quant-v1/quant-train-v1/mlflow/794404334221073423/649c0c6703884d89a8fdeb622632a2d0/artifacts
+deleted_time: 1781797831298
 end_time: 1781794797218
 entry_point_name: ''
 experiment_id: '794404334221073423'
-lifecycle_stage: active
+lifecycle_stage: deleted
 run_id: 649c0c6703884d89a8fdeb622632a2d0
 run_name: Optuna_Auto_Tuning
 source_name: ''
