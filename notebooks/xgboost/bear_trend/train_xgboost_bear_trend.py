@@ -39,11 +39,11 @@ print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 train_dir = os.path.abspath(os.path.join(base_dir, "..", "..", ".."))
-csv_path = os.path.join(train_dir, "dataset", "XAUUSD_H1_features.csv")
+csv_path = os.path.join(train_dir, "dataset", "XAUUSDm_H1_features.csv")
 
 
 if not os.path.exists(csv_path):
-    print("Error: Dataset XAUUSD_H1_features.csv tidak ditemukan!")
+    print("Error: Dataset XAUUSDm_H1_features.csv tidak ditemukan!")
     exit(1)
 
 
@@ -93,16 +93,24 @@ df['tp_pips'] = np.clip(df['tp_pips'], 20.0, None)
 df['close_lag_1'] = df['close'].shift(1)
 df.dropna(inplace=True)
 
-fitur_kategori = ['time', 'future_return', 'target', 'regime', 'highest_high_future', 'lowest_low_future', 'mae_buy', 'mae_sell', 'sl_target', 'sl_pips', 'mfe_buy', 'mfe_sell', 'tp_target', 'tp_pips']
+fitur_kategori = ['time', 'future_return', 'target', 'regime', 'highest_high_future', 'lowest_low_future', 'mae_buy', 'mae_sell', 'sl_target', 'sl_pips', 'mfe_buy', 'mfe_sell', 'tp_target', 'tp_pips', 'open', 'high', 'low', 'close']
 fitur_kategori = [c for c in fitur_kategori if c in df.columns]
 
 X_all = df.drop(columns=fitur_kategori)
 X_all = X_all.astype(np.float32)
 
-y_cls = df['target'].map({-1: 0, 0: 1, 1: 2})
+# Convert to Binary Classification (1 = SELL, 0 = NEUTRAL/BUY)
+y_cls = np.where(df['target'] == -1, 1, 0)
+y_cls = pd.Series(y_cls, index=df.index)
+
+# Calculate class imbalance weight
+pos_count = sum(y_cls == 1)
+neg_count = sum(y_cls == 0)
+scale_pos_weight = float(neg_count / pos_count) if pos_count > 0 else 1.0
+print(f"Class Distribution: {neg_count} NEUTRAL vs {pos_count} SELL (Weight: {scale_pos_weight:.2f})")
 
 print("\nPROGRESS: 40% - Tuning Classifier...\n[1/3] Melatih CLASSIFIER...")
-tscv = TimeSeriesSplit(n_splits=5)
+tscv = TimeSeriesSplit(n_splits=5, gap=N_BARS)
 
 def cls_objective(trial):
     params = {
@@ -111,8 +119,10 @@ def cls_objective(trial):
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'scale_pos_weight': scale_pos_weight,
+        'objective': 'binary:logistic'
     }
-    model = XGBClassifier(**params, random_state=42, eval_metric='mlogloss', n_jobs=-1)
+    model = XGBClassifier(**params, random_state=42, eval_metric='logloss', n_jobs=-1)
     scores = []
     for train_index, test_index in tscv.split(X_all):
         X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
@@ -127,7 +137,7 @@ cls_study.optimize(cls_objective, n_trials=args.optuna_trials)
 best_cls_params = cls_study.best_params
 print(f"Best Classifier Params: {best_cls_params}")
 
-cls_model = XGBClassifier(**best_cls_params, random_state=42, eval_metric='mlogloss', n_jobs=-1)
+cls_model = XGBClassifier(**best_cls_params, scale_pos_weight=scale_pos_weight, objective='binary:logistic', random_state=42, eval_metric='logloss', n_jobs=-1)
 
 acc_last = 0
 report_dict = {}
@@ -268,7 +278,7 @@ for col in X_all.columns:
 metadata = {
     "model_name": model_prefix,
     "features": list(X_all.columns),
-    "classes": {0: "SELL", 1: "NEUTRAL", 2: "BUY"},
+    "classes": {0: "NEUTRAL", 1: "SELL"},
     "baseline_stats": stats
 }
 with open(os.path.join(engine_dir, f'{model_prefix}_metadata.json'), 'w') as f:
@@ -283,8 +293,7 @@ with PdfPages(pdf_path) as pdf:
     report_text = f"ENSEMBLE REPORT: BEAR TREND\n"
     report_text += "="*40 + "\n"
     report_text += f"Classifier Acc : {acc_last:.4f}\n"
-    report_text += f"Precision (SELL): {report_dict.get('0', {}).get('precision', 0.0):.4f}\n"
-    report_text += f"Precision (BUY) : {report_dict.get('2', {}).get('precision', 0.0):.4f}\n"
+    report_text += f"Precision (SELL): {report_dict.get('1', {}).get('precision', 0.0):.4f}\n"
     report_text += f"Best Params (Cls): {best_cls_params}\n"
     if len(X_trend) > 20:
         report_text += f"SL Regressor MAE: {mae_sl:.4f} pips\n"
