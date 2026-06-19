@@ -35,3 +35,7 @@ model/
 *.pkl
 *.joblib
 *.h5
+
+# MLflow Tracking
+mlflow/
+mlflow.db
