@@ -30,6 +30,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--optuna_trials', type=int, default=10)
 parser.add_argument('--model_name', type=str, default=None)
 parser.add_argument('--dataset_file', type=str, default='XAUUSDm_H1_features.csv')
+parser.add_argument('--use_meta', type=str, default='1')
 args = parser.parse_args()
 model_prefix = args.model_name if args.model_name else f'xgboost_mean_reverting_{run_id}'
 
@@ -111,8 +112,18 @@ neg_count = sum(y_cls == 0)
 scale_pos_weight = float(neg_count / pos_count) if pos_count > 0 else 1.0
 print(f"Class Distribution: {neg_count} NO_TRADE vs {pos_count} TRADE (Weight: {scale_pos_weight:.2f})")
 
+print("\n[0/3] Feature Selection (Top 20)...")
+fs_model = XGBClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+fs_model.fit(X_all.values, y_cls)
+feat_imp = pd.Series(fs_model.feature_importances_, index=X_all.columns).nlargest(20)
+top_features = feat_imp.index.tolist()
+X_all = X_all[top_features]
+print(f"Selected Top 20 Features: {top_features}")
+
 print("\nPROGRESS: 40% - Tuning Classifier...\n[1/3] Melatih CLASSIFIER...")
-tscv = TimeSeriesSplit(n_splits=5, gap=N_BARS)
+days_from_end = (df['time'].max() - df['time']).dt.days
+sample_weights = np.exp(-0.001 * days_from_end)
+tscv = TimeSeriesSplit(n_splits=5, gap=N_BARS * 2)
 
 def cls_objective(trial):
     params = {
@@ -129,7 +140,8 @@ def cls_objective(trial):
     for train_index, test_index in tscv.split(X_all):
         X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
         y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
-        model.fit(X_train.values, y_train)
+        w_train = sample_weights.iloc[train_index]
+        model.fit(X_train.values, y_train, sample_weight=w_train.values)
         scores.append(accuracy_score(y_test, model.predict(X_test.values)))
     return np.mean(scores)
 
@@ -141,22 +153,28 @@ print(f"Best Classifier Params: {best_cls_params}")
 
 cls_model = XGBClassifier(**best_cls_params, scale_pos_weight=scale_pos_weight, objective='binary:logistic', random_state=42, eval_metric='logloss', n_jobs=-1)
 
-acc_last = 0
+acc_scores = []
 report_dict = {}
 for train_index, test_index in tscv.split(X_all):
     X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
     y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
-    cls_model.fit(X_train.values, y_train)
+    w_train = sample_weights.iloc[train_index]
+    cls_model.fit(X_train.values, y_train, sample_weight=w_train.values)
     y_pred = cls_model.predict(X_test.values)
-    acc_last = accuracy_score(y_test, y_pred)
+    acc_scores.append(accuracy_score(y_test, y_pred))
     report_dict = classification_report([str(x) for x in y_test], [str(x) for x in y_pred], output_dict=True)
 
+acc_last = acc_scores[-1] if acc_scores else 0
+print(f"Folds Accuracies: {[round(a, 4) for a in acc_scores]}")
+print(f"Mean: {np.mean(acc_scores):.4f}, Std: {np.std(acc_scores):.4f}, Min: {np.min(acc_scores):.4f}, Max: {np.max(acc_scores):.4f}")
 print(f"Classifier Akurasi Akhir: {acc_last:.4f}")
 print("Retraining CLASSIFIER on full dataset...")
-cls_model.fit(X_all.values, y_cls)
+cls_model.fit(X_all.values, y_cls, sample_weight=sample_weights.values)
 
 df_trend = df[df['target'] != 0].copy()
+sample_weights_trend = sample_weights[df['target'] != 0]
 X_trend = df_trend.drop(columns=fitur_kategori).astype(np.float32)
+X_trend = X_trend[top_features]
 y_sl = df_trend['sl_pips']
 y_tp = df_trend['tp_pips']
 
@@ -179,7 +197,8 @@ def sl_objective(trial):
         for train_index, test_index in tscv.split(X_trend):
             X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
             y_train, y_test = y_sl.iloc[train_index], y_sl.iloc[test_index]
-            model.fit(X_train.values, y_train)
+            w_train = sample_weights_trend.iloc[train_index]
+            model.fit(X_train.values, y_train, sample_weight=w_train.values)
             scores.append(mean_absolute_error(y_test, model.predict(X_test.values)))
         return np.mean(scores)
     return 999.0
@@ -195,16 +214,20 @@ else:
 
 sl_model = XGBRegressor(**best_sl_params, random_state=42, n_jobs=-1)
 if len(X_trend) > 20:
+    sl_scores = []
     for train_index, test_index in tscv.split(X_trend):
         X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
         y_train, y_test = y_sl.iloc[train_index], y_sl.iloc[test_index]
-        sl_model.fit(X_train.values, y_train)
-        mae_sl = mean_absolute_error(y_test, sl_model.predict(X_test.values))
+        w_train = sample_weights_trend.iloc[train_index]
+        sl_model.fit(X_train.values, y_train, sample_weight=w_train.values)
+        sl_scores.append(mean_absolute_error(y_test, sl_model.predict(X_test.values)))
+    mae_sl = sl_scores[-1] if sl_scores else 0
+    print(f"Folds MAE: {[round(a, 4) for a in sl_scores]}")
     print(f"SL MAE Akhir: {mae_sl:.4f} pips")
     print("Retraining SL REGRESSOR on full dataset...")
-    sl_model.fit(X_trend.values, y_sl)
+    sl_model.fit(X_trend.values, y_sl, sample_weight=sample_weights_trend.values)
 else:
-    sl_model.fit(X_trend.values, y_sl)
+    sl_model.fit(X_trend.values, y_sl, sample_weight=sample_weights_trend.values)
     mae_sl = 0
 
 print("\nPROGRESS: 80% - Tuning TP Regressor...\n[3/3] Melatih TP REGRESSOR...")
@@ -226,7 +249,8 @@ def tp_objective(trial):
         for train_index, test_index in tscv.split(X_trend):
             X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
             y_train, y_test = y_tp.iloc[train_index], y_tp.iloc[test_index]
-            model.fit(X_train.values, y_train)
+            w_train = sample_weights_trend.iloc[train_index]
+            model.fit(X_train.values, y_train, sample_weight=w_train.values)
             scores.append(mean_absolute_error(y_test, model.predict(X_test.values)))
         return np.mean(scores)
     return 999.0
@@ -242,19 +266,45 @@ else:
 
 tp_model = XGBRegressor(**best_tp_params, random_state=42, n_jobs=-1)
 if len(X_trend) > 20:
+    tp_scores = []
     for train_index, test_index in tscv.split(X_trend):
         X_train, X_test = X_trend.iloc[train_index], X_trend.iloc[test_index]
         y_train, y_test = y_tp.iloc[train_index], y_tp.iloc[test_index]
-        tp_model.fit(X_train.values, y_train)
-        mae_tp = mean_absolute_error(y_test, tp_model.predict(X_test.values))
+        w_train = sample_weights_trend.iloc[train_index]
+        tp_model.fit(X_train.values, y_train, sample_weight=w_train.values)
+        tp_scores.append(mean_absolute_error(y_test, tp_model.predict(X_test.values)))
+    mae_tp = tp_scores[-1] if tp_scores else 0
+    print(f"Folds MAE: {[round(a, 4) for a in tp_scores]}")
     print(f"TP MAE Akhir: {mae_tp:.4f} pips")
     print("Retraining TP REGRESSOR on full dataset...")
-    tp_model.fit(X_trend.values, y_tp)
+    tp_model.fit(X_trend.values, y_tp, sample_weight=sample_weights_trend.values)
 else:
-    tp_model.fit(X_trend.values, y_tp)
+    tp_model.fit(X_trend.values, y_tp, sample_weight=sample_weights_trend.values)
     mae_tp = 0
 
-print("\nMengekspor 3 model ke format ONNX...")
+if args.use_meta == "1":
+    print("\n[Meta] Melatih Meta-Model untuk Confidence Calibration...")
+    from sklearn.model_selection import cross_val_predict
+
+# Generate OOF predictions and probabilities
+    y_pred_oof = cross_val_predict(cls_model, X_all.values, y_cls, cv=5, method='predict', n_jobs=-1)
+    y_proba_oof = cross_val_predict(cls_model, X_all.values, y_cls, cv=5, method='predict_proba', n_jobs=-1)
+    confidence_oof = np.max(y_proba_oof, axis=1)
+
+# Create Meta-Labels: 1 if Primary Model is correct, 0 otherwise
+    y_meta = (y_pred_oof == y_cls).astype(int)
+
+# Create Meta-Features: Original features + primary confidence
+    X_meta = X_all.copy()
+    X_meta['primary_confidence'] = confidence_oof
+
+# Train Meta-Model
+    meta_model = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, n_jobs=-1, eval_metric='logloss')
+    meta_model.fit(X_meta.values, y_meta)
+    meta_acc = accuracy_score(y_meta, meta_model.predict(X_meta.values))
+    print(f"Meta-Model Akurasi: {meta_acc:.4f}")
+
+print("\nMengekspor model ke format ONNX...")
 initial_type = [('float_input', FloatTensorType([None, X_all.shape[1]]))]
 
 onnx_cls = onnxmltools.convert_xgboost(cls_model, initial_types=initial_type)
@@ -271,6 +321,11 @@ names = [
     (f'{model_prefix}_sl.onnx', onnx_sl),
     (f'{model_prefix}_tp.onnx', onnx_tp)
 ]
+
+if args.use_meta == "1":
+    meta_initial_type = [('float_input', FloatTensorType([None, X_meta.shape[1]]))]
+    onnx_meta = onnxmltools.convert_xgboost(meta_model, initial_types=meta_initial_type)
+    names.append((f'{model_prefix}_meta.onnx', onnx_meta))
 
 for filename, model_onnx in names:
     onnx.save(model_onnx, os.path.join(engine_dir, filename))
@@ -289,7 +344,8 @@ metadata = {
     "model_name": model_prefix,
     "features": list(X_all.columns),
     "classes": {0: "NEUTRAL", 1: "TRADE"},
-    "baseline_stats": stats
+    "baseline_stats": stats,
+    "uses_meta": (args.use_meta == "1")
 }
 with open(os.path.join(engine_dir, f'{model_prefix}_metadata.json'), 'w') as f:
     json.dump(metadata, f, indent=4)
