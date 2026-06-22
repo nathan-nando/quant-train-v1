@@ -9,7 +9,7 @@ import os
 import glob
 from xgboost import XGBClassifier, XGBRegressor
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, accuracy_score, mean_absolute_error, mean_squared_error, f1_score
+from sklearn.metrics import classification_report, accuracy_score, f1_score, fbeta_score, mean_absolute_error, mean_squared_error
 from sklearn.utils.class_weight import compute_sample_weight
 import onnxmltools
 from onnxmltools.convert.common.data_types import FloatTensorType
@@ -152,7 +152,7 @@ def cls_objective(trial):
         y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
         w_train = sample_weights.iloc[train_index]
         model.fit(X_train.values, y_train, sample_weight=w_train.values)
-        scores.append(f1_score(y_test, model.predict(X_test.values), average='macro'))
+        scores.append(fbeta_score(y_test, model.predict(X_test.values), beta=0.5, average='macro'))
     return np.mean(scores)
 
 print("Starting Optuna Study for CLASSIFIER...")
@@ -163,7 +163,7 @@ print(f"Best Classifier Params: {best_cls_params}")
 
 cls_model = XGBClassifier(**best_cls_params, objective='multi:softprob', num_class=3, random_state=42, eval_metric='mlogloss', n_jobs=-1)
 
-acc_scores = []
+f1_scores = []
 report_dict = {}
 for train_index, test_index in tscv.split(X_all):
     X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
@@ -171,14 +171,13 @@ for train_index, test_index in tscv.split(X_all):
     w_train = sample_weights.iloc[train_index]
     cls_model.fit(X_train.values, y_train, sample_weight=w_train.values)
     y_pred = cls_model.predict(X_test.values)
-    acc_scores.append(f1_score(y_test, y_pred, average='macro'))
+    f1_scores.append(fbeta_score(y_test, y_pred, beta=0.5, average='macro'))
     report_dict = classification_report([str(x) for x in y_test], [str(x) for x in y_pred], output_dict=True)
 
-f1_last = acc_scores[-1] if acc_scores else 0
-print(f"Folds Macro F1: {[round(a, 4) for a in acc_scores]}")
-print(f"Mean F1: {np.mean(acc_scores):.4f}, Std: {np.std(acc_scores):.4f}, Min: {np.min(acc_scores):.4f}, Max: {np.max(acc_scores):.4f}")
-print(f"Classifier Macro F1 Akhir: {f1_last:.4f}")
-acc_last = accuracy_score(y_test, y_pred) if len(acc_scores) > 0 else 0
+f1_last = f1_scores[-1] if f1_scores else 0
+print(f"Folds Macro F0.5: {[round(a, 4) for a in f1_scores]}")
+print(f"Mean F0.5: {np.mean(f1_scores):.4f}, Std: {np.std(f1_scores):.4f}, Min: {np.min(f1_scores):.4f}, Max: {np.max(f1_scores):.4f}")
+print(f"Classifier Macro F0.5 Akhir: {f1_last:.4f}")
 print("Retraining CLASSIFIER on full dataset...")
 cls_model.fit(X_all.values, y_cls, sample_weight=sample_weights.values)
 
@@ -369,7 +368,7 @@ with PdfPages(pdf_path) as pdf:
     plt.axis('off')
     report_text = f"ENSEMBLE REPORT: MEAN REVERTING\n"
     report_text += "="*40 + "\n"
-    report_text += f"Macro F1 : {f1_last:.4f}\n"
+    report_text += f"Classifier F0.5 : {f1_last:.4f}\n"
     report_text += f"Prec (BUY): {report_dict.get('1', {}).get('precision', 0.0):.4f} | Prec (SELL): {report_dict.get('2', {}).get('precision', 0.0):.4f}\n"
     report_text += f"Best Params (Cls): {best_cls_params}\n"
     if len(X_trend) > 20:
@@ -412,7 +411,7 @@ with mlflow.start_run(run_name="Optuna_Auto_Tuning"):
     mlflow.log_params({"tp_" + k: v for k, v in best_tp_params.items()})
     
     # Log metrics
-    mlflow.log_metric("cls_accuracy", acc_last)
+    mlflow.log_metric("cls_f05", f1_last)
     if 'mae_sl' in locals():
         mlflow.log_metric("sl_mae", mae_sl)
         mlflow.log_metric("tp_mae", mae_tp)
@@ -465,7 +464,7 @@ try:
     payload = {
         "name": model_prefix,
         "algorithm_type": "XGBoost Ensemble",
-        "accuracy": f"{acc_last*100:.2f}%",
+        "accuracy": f"{f1_last*100:.2f}%",
         "status": "Inactive",
         "train_start_time": train_start_time,
         "train_duration_sec": train_duration_sec,
