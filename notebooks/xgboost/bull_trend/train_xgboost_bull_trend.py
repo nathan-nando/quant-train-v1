@@ -9,7 +9,7 @@ import os
 import glob
 from xgboost import XGBClassifier, XGBRegressor
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, accuracy_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import classification_report, accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 import onnxmltools
 from onnxmltools.convert.common.data_types import FloatTensorType
 import onnx
@@ -37,6 +37,11 @@ warnings.filterwarnings('ignore')
 
 print("=========================================")
 print("  Memulai Pelatihan Bull Trend Ensemble...")
+print("=========================================")
+print(f"  [Config] Model Prefix  : {model_prefix}")
+print(f"  [Config] Dataset File  : {args.dataset_file}")
+print(f"  [Config] Optuna Trials : {args.optuna_trials}")
+print(f"  [Config] Meta Labeling : {'ON' if str(args.use_meta) == '1' else 'OFF'}")
 print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -142,7 +147,7 @@ def cls_objective(trial):
         y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
         w_train = sample_weights.iloc[train_index]
         model.fit(X_train.values, y_train, sample_weight=w_train.values)
-        scores.append(accuracy_score(y_test, model.predict(X_test.values)))
+        scores.append(f1_score(y_test, model.predict(X_test.values), average='macro'))
     return np.mean(scores)
 
 print("Starting Optuna Study for CLASSIFIER...")
@@ -423,6 +428,26 @@ try:
     except:
         hyper_str = "{}"
 
+    print("\n=========================================")
+    print("  FINAL CONFIGURATION & HYPERPARAMETERS  ")
+    print("=========================================")
+    try:
+        hyper_dict = json.loads(hyper_str)
+        print("--- HYPERPARAMETERS ---")
+        for m_type, params in hyper_dict.items():
+            print(f"[{m_type.upper()}]")
+            for k, v in params.items():
+                print(f"  > {k:<14} : {v}")
+    except: pass
+
+    print("\n--- METADATA ---")
+    for k, v in metadata.items():
+        if isinstance(v, list):
+            print(f"  > {k:<14} : [{len(v)} items]")
+        else:
+            print(f"  > {k:<14} : {v}")
+    print("=========================================\n")
+
     payload = {
         "name": model_prefix,
         "algorithm_type": "XGBoost Ensemble",
@@ -432,7 +457,8 @@ try:
         "train_duration_sec": train_duration_sec,
         "metrics_report": report_str,
         "hyperparameters": hyper_str,
-        "metadata": json.dumps(metadata)
+        "metadata": json.dumps(metadata),
+        "regime": "TREND_BULL"
     }
     res = requests.post("http://127.0.0.1:8000/api/models/", json=payload)
     if res.status_code == 200:

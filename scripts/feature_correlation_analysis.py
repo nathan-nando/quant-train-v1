@@ -3,8 +3,9 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import os
+import argparse
 
-def run_correlation_analysis(csv_path="c:/code/quant-v1/quant-train-v1/dataset/XAUUSD_H1_features.csv"):
+def run_correlation_analysis(csv_path):
     if not os.path.exists(csv_path):
         print(f"Dataset not found at {csv_path}")
         return
@@ -14,8 +15,13 @@ def run_correlation_analysis(csv_path="c:/code/quant-v1/quant-train-v1/dataset/X
     
     print(f"Dataset shape: {df.shape}")
     
-    # Exclude non-feature columns
-    exclude_cols = ['time', 'regime', 'future_return', 'target', 'sl_pips', 'tp_pips', 'atr_14', 'close_lag_1']
+    # Exclude non-feature and raw price columns
+    exclude_cols = [
+        'time', 'regime', 'future_return', 'target', 'sl_pips', 'tp_pips', 
+        'atr_14', 'close_lag_1', 'open', 'high', 'low', 'close', 'spread',
+        'highest_high_future', 'lowest_low_future', 'mae_buy', 'mae_sell', 
+        'sl_target', 'mfe_buy', 'mfe_sell', 'tp_target'
+    ]
     features = [col for col in df.columns if col not in exclude_cols]
     
     print(f"\nAnalyzing {len(features)} features...")
@@ -60,4 +66,13 @@ def run_correlation_analysis(csv_path="c:/code/quant-v1/quant-train-v1/dataset/X
             print(f"DEAD FEATURE: {col} (Unique values: {df[col].nunique()})")
             
 if __name__ == "__main__":
-    run_correlation_analysis()
+    parser = argparse.ArgumentParser(description="Feature Correlation Analysis")
+    parser.add_argument(
+        "--dataset", 
+        type=str, 
+        default="c:/code/quant-v1/quant-train-v1/dataset/XAUUSD_DEFAULT.csv",
+        help="Path to the dataset CSV file"
+    )
+    args = parser.parse_args()
+    run_correlation_analysis(args.dataset)
+

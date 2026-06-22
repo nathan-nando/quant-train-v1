@@ -39,6 +39,11 @@ warnings.filterwarnings('ignore')
 print("=========================================")
 print("  Memulai Pelatihan Mean Reverting Ensemble...")
 print("=========================================")
+print(f"  [Config] Model Prefix  : {model_prefix}")
+print(f"  [Config] Dataset File  : {args.dataset_file}")
+print(f"  [Config] Optuna Trials : {args.optuna_trials}")
+print(f"  [Config] Meta Labeling : {'ON' if str(args.use_meta) == '1' else 'OFF'}")
+print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 train_dir = os.path.abspath(os.path.join(base_dir, "..", "..", ".."))
@@ -72,7 +77,7 @@ conditions = [
     (df['future_return'] > THRESHOLD),
     (df['future_return'] < -THRESHOLD)
 ]
-choices = [1, -1]
+choices = [1, 2] # 1 = BUY, 2 = SELL
 df['target'] = np.select(conditions, choices, default=0)
 
 # MAE / MFE untuk SL & TP
@@ -82,14 +87,14 @@ df['lowest_low_future'] = df['low'].rolling(window=N_BARS).min().shift(-N_BARS)
 # SL Calculation (MAE)
 df['mae_buy'] = df['close'] - df['lowest_low_future']
 df['mae_sell'] = df['highest_high_future'] - df['close']
-df['sl_target'] = np.where(df['target'] == 1, df['mae_buy'], np.where(df['target'] == -1, df['mae_sell'], 0.0))
+df['sl_target'] = np.where(df['target'] == 1, df['mae_buy'], np.where(df['target'] == 2, df['mae_sell'], 0.0))
 df['sl_pips'] = df['sl_target'] * 10
 df['sl_pips'] = np.clip(df['sl_pips'], 15.0, None)
 
 # TP Calculation (MFE)
 df['mfe_buy'] = df['highest_high_future'] - df['close']
 df['mfe_sell'] = df['close'] - df['lowest_low_future']
-df['tp_target'] = np.where(df['target'] == 1, df['mfe_buy'], np.where(df['target'] == -1, df['mfe_sell'], 0.0))
+df['tp_target'] = np.where(df['target'] == 1, df['mfe_buy'], np.where(df['target'] == 2, df['mfe_sell'], 0.0))
 df['tp_pips'] = df['tp_target'] * 10
 df['tp_pips'] = np.clip(df['tp_pips'], 20.0, None)
 
@@ -102,15 +107,18 @@ fitur_kategori = [c for c in fitur_kategori if c in df.columns]
 X_all = df.drop(columns=fitur_kategori)
 X_all = X_all.astype(np.float32)
 
-# Konversi ke Binary Classification (1 = TRADE, 0 = NO_TRADE)
-y_cls = np.where(df['target'] != 0, 1, 0)
+# Gunakan Multi-Class: 0 = NEUTRAL, 1 = BUY, 2 = SELL
+y_cls = df['target'].copy()
 y_cls = pd.Series(y_cls, index=df.index)
 
 # Hitung class imbalance weight
-pos_count = sum(y_cls == 1)
-neg_count = sum(y_cls == 0)
-scale_pos_weight = float(neg_count / pos_count) if pos_count > 0 else 1.0
-print(f"Class Distribution: {neg_count} NO_TRADE vs {pos_count} TRADE (Weight: {scale_pos_weight:.2f})")
+buy_count = sum(y_cls == 1)
+sell_count = sum(y_cls == 2)
+neutral_count = sum(y_cls == 0)
+print(f"Class Distribution: {neutral_count} NEUTRAL, {buy_count} BUY, {sell_count} SELL")
+
+from sklearn.utils.class_weight import compute_sample_weight
+imbalance_weights = compute_sample_weight('balanced', y_cls)
 
 print("\n[0/3] Feature Selection (Top 20)...")
 fs_model = XGBClassifier(n_estimators=50, random_state=42, n_jobs=-1)
@@ -122,7 +130,9 @@ print(f"Selected Top 20 Features: {top_features}")
 
 print("\nPROGRESS: 40% - Tuning Classifier...\n[1/3] Melatih CLASSIFIER...")
 days_from_end = (df['time'].max() - df['time']).dt.days
-sample_weights = np.exp(-0.001 * days_from_end)
+# Gabungkan exponential decay weight dengan imbalance weight
+combined_weights = np.exp(-0.001 * days_from_end) * imbalance_weights
+sample_weights = pd.Series(combined_weights, index=df.index)
 tscv = TimeSeriesSplit(n_splits=5, gap=N_BARS * 2)
 
 def cls_objective(trial):
@@ -132,17 +142,17 @@ def cls_objective(trial):
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'scale_pos_weight': scale_pos_weight,
-        'objective': 'binary:logistic'
+        'objective': 'multi:softprob',
+        'num_class': 3
     }
-    model = XGBClassifier(**params, random_state=42, eval_metric='logloss', n_jobs=-1)
+    model = XGBClassifier(**params, random_state=42, eval_metric='mlogloss', n_jobs=-1)
     scores = []
     for train_index, test_index in tscv.split(X_all):
         X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
         y_train, y_test = y_cls.iloc[train_index], y_cls.iloc[test_index]
         w_train = sample_weights.iloc[train_index]
         model.fit(X_train.values, y_train, sample_weight=w_train.values)
-        scores.append(accuracy_score(y_test, model.predict(X_test.values)))
+        scores.append(f1_score(y_test, model.predict(X_test.values), average='macro'))
     return np.mean(scores)
 
 print("Starting Optuna Study for CLASSIFIER...")
@@ -151,7 +161,7 @@ cls_study.optimize(cls_objective, n_trials=args.optuna_trials)
 best_cls_params = cls_study.best_params
 print(f"Best Classifier Params: {best_cls_params}")
 
-cls_model = XGBClassifier(**best_cls_params, scale_pos_weight=scale_pos_weight, objective='binary:logistic', random_state=42, eval_metric='logloss', n_jobs=-1)
+cls_model = XGBClassifier(**best_cls_params, objective='multi:softprob', num_class=3, random_state=42, eval_metric='mlogloss', n_jobs=-1)
 
 acc_scores = []
 report_dict = {}
@@ -161,13 +171,14 @@ for train_index, test_index in tscv.split(X_all):
     w_train = sample_weights.iloc[train_index]
     cls_model.fit(X_train.values, y_train, sample_weight=w_train.values)
     y_pred = cls_model.predict(X_test.values)
-    acc_scores.append(accuracy_score(y_test, y_pred))
+    acc_scores.append(f1_score(y_test, y_pred, average='macro'))
     report_dict = classification_report([str(x) for x in y_test], [str(x) for x in y_pred], output_dict=True)
 
-acc_last = acc_scores[-1] if acc_scores else 0
-print(f"Folds Accuracies: {[round(a, 4) for a in acc_scores]}")
-print(f"Mean: {np.mean(acc_scores):.4f}, Std: {np.std(acc_scores):.4f}, Min: {np.min(acc_scores):.4f}, Max: {np.max(acc_scores):.4f}")
-print(f"Classifier Akurasi Akhir: {acc_last:.4f}")
+f1_last = acc_scores[-1] if acc_scores else 0
+print(f"Folds Macro F1: {[round(a, 4) for a in acc_scores]}")
+print(f"Mean F1: {np.mean(acc_scores):.4f}, Std: {np.std(acc_scores):.4f}, Min: {np.min(acc_scores):.4f}, Max: {np.max(acc_scores):.4f}")
+print(f"Classifier Macro F1 Akhir: {f1_last:.4f}")
+acc_last = accuracy_score(y_test, y_pred) if len(acc_scores) > 0 else 0
 print("Retraining CLASSIFIER on full dataset...")
 cls_model.fit(X_all.values, y_cls, sample_weight=sample_weights.values)
 
@@ -343,7 +354,7 @@ for col in X_all.columns:
 metadata = {
     "model_name": model_prefix,
     "features": list(X_all.columns),
-    "classes": {0: "NEUTRAL", 1: "TRADE"},
+    "classes": {0: "NEUTRAL", 1: "BUY", 2: "SELL"},
     "baseline_stats": stats,
     "uses_meta": (args.use_meta == "1")
 }
@@ -358,8 +369,8 @@ with PdfPages(pdf_path) as pdf:
     plt.axis('off')
     report_text = f"ENSEMBLE REPORT: MEAN REVERTING\n"
     report_text += "="*40 + "\n"
-    report_text += f"Classifier Acc : {acc_last:.4f}\n"
-    report_text += f"Precision (TRADE): {report_dict.get('1', {}).get('precision', 0.0):.4f}\n"
+    report_text += f"Macro F1 : {f1_last:.4f}\n"
+    report_text += f"Prec (BUY): {report_dict.get('1', {}).get('precision', 0.0):.4f} | Prec (SELL): {report_dict.get('2', {}).get('precision', 0.0):.4f}\n"
     report_text += f"Best Params (Cls): {best_cls_params}\n"
     if len(X_trend) > 20:
         report_text += f"SL Regressor MAE: {mae_sl:.4f} pips\n"
@@ -431,6 +442,26 @@ try:
     except:
         hyper_str = "{}"
 
+    print("\n=========================================")
+    print("  FINAL CONFIGURATION & HYPERPARAMETERS  ")
+    print("=========================================")
+    try:
+        hyper_dict = json.loads(hyper_str)
+        print("--- HYPERPARAMETERS ---")
+        for m_type, params in hyper_dict.items():
+            print(f"[{m_type.upper()}]")
+            for k, v in params.items():
+                print(f"  > {k:<14} : {v}")
+    except: pass
+
+    print("\n--- METADATA ---")
+    for k, v in metadata.items():
+        if isinstance(v, list):
+            print(f"  > {k:<14} : [{len(v)} items]")
+        else:
+            print(f"  > {k:<14} : {v}")
+    print("=========================================\n")
+
     payload = {
         "name": model_prefix,
         "algorithm_type": "XGBoost Ensemble",
@@ -440,7 +471,8 @@ try:
         "train_duration_sec": train_duration_sec,
         "metrics_report": report_str,
         "hyperparameters": hyper_str,
-        "metadata": json.dumps(metadata)
+        "metadata": json.dumps(metadata),
+        "regime": "MEAN_REVERTING"
     }
     res = requests.post("http://127.0.0.1:8000/api/models/", json=payload)
     if res.status_code == 200:
