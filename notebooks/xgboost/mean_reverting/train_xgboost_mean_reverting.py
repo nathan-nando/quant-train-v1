@@ -387,6 +387,15 @@ with PdfPages(pdf_path) as pdf:
     plt.tight_layout()
     pdf.savefig()
     plt.close()
+    
+    # Save Feature Importance Drift
+    import sys, os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+    try:
+        from utils.drift_tracker import FeatureDriftTracker
+        FeatureDriftTracker.save_feature_importance("MEAN_REVERTING", feat_imp.to_dict())
+    except ImportError:
+        pass
 
 
 # ==========================================
