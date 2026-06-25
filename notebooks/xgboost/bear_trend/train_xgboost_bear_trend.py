@@ -30,7 +30,7 @@ parser.add_argument('--optuna_trials', type=int, default=50)
 parser.add_argument('--model_name', type=str, default=None)
 parser.add_argument('--dataset_file', type=str, default='XAUUSDm_H1_features.csv')
 parser.add_argument('--use_meta', type=str, default='1')
-parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help="Device to use for training ('cpu' or 'cuda')")
+parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], help="Device to use for training ('cpu' or 'cuda')")
 args = parser.parse_args()
 model_prefix = args.model_name if args.model_name else f'xgboost_bear_trend_{run_id}'
 
