@@ -1,0 +1,1 @@
+Notebook untuk menghasilkan model gain moderat dan drawdown kecil.
