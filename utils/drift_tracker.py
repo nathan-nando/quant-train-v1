@@ -3,11 +3,14 @@ import os
 import datetime
 import logging
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DRIFT_DIR = os.path.join(BASE_DIR, "feature_drift")
+
 logger = logging.getLogger(__name__)
 
 class FeatureDriftTracker:
     @staticmethod
-    def save_feature_importance(regime: str, feature_importances: dict, output_dir: str = "feature_drift"):
+    def save_feature_importance(regime: str, feature_importances: dict, output_dir: str = DEFAULT_DRIFT_DIR):
         """
         Saves the top feature importances for a given regime training run.
         This allows tracking Feature Importance Drift over time.
@@ -29,7 +32,7 @@ class FeatureDriftTracker:
             logger.error(f"Failed to save feature importance: {e}")
 
     @staticmethod
-    def analyze_drift(regime: str, input_dir: str = "feature_drift", lookback_runs: int = 5):
+    def analyze_drift(regime: str, input_dir: str = DEFAULT_DRIFT_DIR, lookback_runs: int = 5):
         """
         Analyzes if top-20 features have drifted over recent training runs.
         """
