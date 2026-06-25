@@ -30,10 +30,29 @@ parser.add_argument('--optuna_trials', type=int, default=50)
 parser.add_argument('--model_name', type=str, default=None)
 parser.add_argument('--dataset_file', type=str, default='XAUUSDm_H1_features.csv')
 parser.add_argument('--use_meta', type=str, default='1')
+parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help="Device to use for training ('cpu' or 'cuda')")
 args = parser.parse_args()
 model_prefix = args.model_name if args.model_name else f'xgboost_bear_trend_{run_id}'
 
 warnings.filterwarnings('ignore')
+
+device = args.device
+if device == 'cuda':
+    try:
+        import xgboost as xgb
+        d_test = xgb.DMatrix([[1.0, 2.0]], label=[1])
+        xgb.train({'device': 'cuda'}, d_test, num_boost_round=1)
+    except Exception as e:
+        print(f"WARNING: CUDA device test failed ({e}). Falling back to CPU.")
+        device = 'cpu'
+
+def get_xgb_params(base_params=None):
+    params = base_params.copy() if base_params else {}
+    if device == 'cuda':
+        params['device'] = 'cuda'
+    else:
+        params['n_jobs'] = -1
+    return params
 
 print("=========================================")
 print("  Memulai Pelatihan Bear Trend Ensemble...")
@@ -42,6 +61,7 @@ print(f"  [Config] Model Prefix  : {model_prefix}")
 print(f"  [Config] Dataset File  : {args.dataset_file}")
 print(f"  [Config] Optuna Trials : {args.optuna_trials}")
 print(f"  [Config] Meta Labeling : {'ON' if str(args.use_meta) == '1' else 'OFF'}")
+print(f"  [Config] Device         : {'GPU (CUDA)' if device == 'cuda' else 'CPU'}")
 print("=========================================")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -122,7 +142,7 @@ scale_pos_weight = float(neg_count / pos_count) if pos_count > 0 else 1.0
 print(f"Class Distribution: {neg_count} NEUTRAL vs {pos_count} SELL (Weight: {scale_pos_weight:.2f})")
 
 print("\n[0/3] Feature Selection (Top 20)...")
-fs_model = XGBClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+fs_model = XGBClassifier(**get_xgb_params({'n_estimators': 50, 'random_state': 42}))
 train_size = int(len(X_all) * 0.8)
 fs_model.fit(X_all.iloc[:train_size].values, y_cls.iloc[:train_size])
 feat_imp = pd.Series(fs_model.feature_importances_, index=X_all.columns).nlargest(20)
@@ -145,7 +165,7 @@ def cls_objective(trial):
         'scale_pos_weight': scale_pos_weight,
         'objective': 'binary:logistic'
     }
-    model = XGBClassifier(**params, random_state=42, eval_metric='logloss', n_jobs=-1)
+    model = XGBClassifier(**get_xgb_params({**params, 'random_state': 42, 'eval_metric': 'logloss'}))
     scores = []
     for train_index, test_index in tscv.split(X_all):
         X_train, X_test = X_all.iloc[train_index], X_all.iloc[test_index]
@@ -161,7 +181,7 @@ cls_study.optimize(cls_objective, n_trials=args.optuna_trials)
 best_cls_params = cls_study.best_params
 print(f"Best Classifier Params: {best_cls_params}")
 
-cls_model = XGBClassifier(**best_cls_params, scale_pos_weight=scale_pos_weight, objective='binary:logistic', random_state=42, eval_metric='logloss', n_jobs=-1)
+cls_model = XGBClassifier(**get_xgb_params({**best_cls_params, 'scale_pos_weight': scale_pos_weight, 'objective': 'binary:logistic', 'random_state': 42, 'eval_metric': 'logloss'}))
 
 f1_scores = []
 report_dict = {}
@@ -197,7 +217,7 @@ def sl_objective(trial):
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
     }
-    model = XGBRegressor(**params, random_state=42, n_jobs=-1)
+    model = XGBRegressor(**get_xgb_params({**params, 'random_state': 42}))
     scores = []
     if len(X_trend) > 20:
         for train_index, test_index in tscv.split(X_trend):
@@ -218,7 +238,7 @@ if len(X_trend) > 20:
 else:
     best_sl_params = {'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05}
 
-sl_model = XGBRegressor(**best_sl_params, random_state=42, n_jobs=-1)
+sl_model = XGBRegressor(**get_xgb_params({**best_sl_params, 'random_state': 42}))
 if len(X_trend) > 20:
     sl_scores = []
     for train_index, test_index in tscv.split(X_trend):
@@ -245,7 +265,7 @@ def tp_objective(trial):
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
     }
-    model = XGBRegressor(**params, random_state=42, n_jobs=-1)
+    model = XGBRegressor(**get_xgb_params({**params, 'random_state': 42}))
     scores = []
     if len(X_trend) > 20:
         for train_index, test_index in tscv.split(X_trend):
@@ -266,7 +286,7 @@ if len(X_trend) > 20:
 else:
     best_tp_params = {'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05}
 
-tp_model = XGBRegressor(**best_tp_params, random_state=42, n_jobs=-1)
+tp_model = XGBRegressor(**get_xgb_params({**best_tp_params, 'random_state': 42}))
 if len(X_trend) > 20:
     tp_scores = []
     for train_index, test_index in tscv.split(X_trend):
@@ -301,7 +321,7 @@ if args.use_meta == "1":
     X_meta['primary_confidence'] = confidence_oof
 
 # Train Meta-Model
-    meta_model = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, n_jobs=-1, eval_metric='logloss')
+    meta_model = XGBClassifier(**get_xgb_params({'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05, 'random_state': 42, 'eval_metric': 'logloss'}))
     meta_model.fit(X_meta.values, y_meta)
     meta_acc = accuracy_score(y_meta, meta_model.predict(X_meta.values))
     print(f"Meta-Model Akurasi: {meta_acc:.4f}")
