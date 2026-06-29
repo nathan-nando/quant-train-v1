@@ -94,8 +94,8 @@ df['future_return'] = (df['close'].shift(-N_BARS) - df['close']) / df['close']
 df['atr_normalized'] = df['atr_pct'] / 100.0
 
 conditions = [
-    ((df['bb_position'] < 0.3) & (df['future_return'] > df['atr_normalized'] * 1.0)),
-    ((df['bb_position'] > 0.7) & (df['future_return'] < -df['atr_normalized'] * 1.0))
+    ((df['bb_position'] < 0.4) & (df['future_return'] > df['atr_normalized'] * 0.5)),
+    ((df['bb_position'] > 0.6) & (df['future_return'] < -df['atr_normalized'] * 0.5))
 ]
 choices = [1, 1]
 df['target'] = np.select(conditions, choices, default=0)
@@ -118,8 +118,9 @@ df['sl_pips'] = df['sl_target'] * 10
 df['sl_pips'] = np.clip(df['sl_pips'], 15.0, None)
 
 # TP Calculation (Dynamic Risk-Reward)
-df['tp_buy_dist'] = df['sl_buy_dist'] * 2.0
-df['tp_sell_dist'] = df['sl_sell_dist'] * 2.0
+# For Mean Reverting, we target small wins instead of aggressive 2.0x target
+df['tp_buy_dist'] = df['sl_buy_dist'] * 1.0
+df['tp_sell_dist'] = df['sl_sell_dist'] * 1.0
 df['tp_target'] = np.where((df['target'] == 1) & (df['future_return'] > 0), df['tp_buy_dist'], 
                   np.where((df['target'] == 1) & (df['future_return'] < 0), df['tp_sell_dist'], 0.0))
 df['tp_pips'] = df['tp_target'] * 10
