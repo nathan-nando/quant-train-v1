@@ -5,6 +5,7 @@ import joblib
 import os
 import logging
 import argparse
+from sklearn.preprocessing import StandardScaler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -69,17 +70,36 @@ def train_hmm(args=None):
     print("PROGRESS: 40% - Preparing dataset and feature matrices...")
     X = df[features].values
     
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
     # Fit HMM
     # 4 States: 
     # 0 = Low Vol Trend, 1 = High Vol Trend, 2 = Mean Reverting, 3 = Volatile Chop (or Crisis)
     n_components = 4
-    print("PROGRESS: 60% - Fitting 4-State Gaussian HMM...")
-    logger.info(f"Training Gaussian HMM with {n_components} components...")
+    print("PROGRESS: 60% - Fitting 4-State Gaussian HMM with 10 random restarts...")
+    logger.info(f"Training Gaussian HMM with {n_components} components and 10 restarts...")
     
-    model = hmm.GaussianHMM(n_components=n_components, covariance_type="full", n_iter=100, random_state=42)
-    model.fit(X)
-    
-    logger.info(f"HMM Training converged: {model.monitor_.converged}")
+    best_model = None
+    best_score = -np.inf
+    for seed in range(42, 52):
+        model = hmm.GaussianHMM(n_components=n_components, covariance_type="full", n_iter=100, random_state=seed)
+        try:
+            model.fit(X_scaled)
+            score = model.score(X_scaled)
+            logger.info(f"Seed {seed}: log-likelihood = {score:.2f}, converged = {model.monitor_.converged}")
+            if score > best_score:
+                best_score = score
+                best_model = model
+        except Exception as e:
+            logger.warning(f"Seed {seed} failed to fit: {e}")
+            
+    if best_model is None:
+        logger.error("All HMM training runs failed!")
+        return
+        
+    model = best_model
+    logger.info(f"Best HMM selected with log-likelihood: {best_score:.2f}")
     print("PROGRESS: 85% - Saving HMM model artifacts...")
     
     # Save model
@@ -89,6 +109,7 @@ def train_hmm(args=None):
     model_path = os.path.join(model_dir, file_name_base)
     joblib.dump({
         'model': model,
+        'scaler': scaler,
         'features': features
     }, model_path)
     
@@ -99,6 +120,7 @@ def train_hmm(args=None):
     
     joblib.dump({
         'model': model,
+        'scaler': scaler,
         'features': features
     }, engine_model_path)
     

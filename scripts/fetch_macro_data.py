@@ -113,6 +113,7 @@ def fetch_macro_data():
     if 'vix' in macro_df.columns:
         macro_df['vix_level'] = macro_df['vix']
         macro_df['vix_chg_1d'] = macro_df['vix'].diff(1)
+        macro_df['vix_zscore_20d'] = (macro_df['vix'] - macro_df['vix'].rolling(20).mean()) / macro_df['vix'].rolling(20).std().replace(0, 1)
         macro_df['vix_regime'] = pd.cut(macro_df['vix'], bins=[0, 15, 25, 40, 1000], labels=[0, 1, 2, 3], right=False).astype(float)
 
     if 'yield_10y' in macro_df.columns and 'yield_2y' in macro_df.columns:
@@ -124,6 +125,7 @@ def fetch_macro_data():
 
     if 'fed_rate' in macro_df.columns:
         macro_df['fed_rate_level'] = macro_df['fed_rate']
+        macro_df['fed_rate_change_20d'] = macro_df['fed_rate'].diff(20)
         macro_df['fed_hiking'] = (macro_df['fed_rate'].diff(1) > 0).astype(float)
         macro_df['fed_cutting'] = (macro_df['fed_rate'].diff(1) < 0).astype(float)
 

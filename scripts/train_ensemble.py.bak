@@ -21,8 +21,8 @@ def create_target(df):
     future_ret = df['close'].shift(-5) / df['close'] - 1
     
     target = np.ones(len(df)) # Default NEUTRAL
-    target[future_ret > 0.0035] = 2 # BUY (> 0.35%)
-    target[future_ret < -0.0035] = 0 # SELL (< -0.35%)
+    target[future_ret > 0.005] = 2 # BUY (> 0.5%)
+    target[future_ret < -0.005] = 0 # SELL (< -0.5%)
     
     df['target_direction'] = target
     df['future_return'] = future_ret
@@ -35,10 +35,8 @@ def get_balanced_weights(y, max_weight=10.0):
     return np.clip(sw, 0.1, max_weight)
 
 def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
-    num_classes = len(np.unique(y))
-    obj = 'multi:softprob' if num_classes > 2 else 'binary:logistic'
     if n_trials <= 0:
-        model = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, objective=obj, tree_method='hist')
+        model = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, objective='multi:softprob')
         sw = get_balanced_weights(y)
         model.fit(X, y, sample_weight=sw)
         return model
@@ -50,11 +48,7 @@ def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
             'n_estimators': trial.suggest_int('n_estimators', 50, 200),
             'max_depth': trial.suggest_int('max_depth', 3, 7),
             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.2, log=True),
-            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-            'gamma': trial.suggest_float('gamma', 0.0, 10.0),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
-            'objective': obj,
+            'objective': 'multi:softprob',
             'tree_method': 'hist' # Prevent bad allocation with large weights
         }
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
@@ -69,7 +63,7 @@ def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
     study.optimize(objective, n_trials=n_trials)
     
     print(f"[{prefix}] Best params: {study.best_params} | Best Score: {study.best_value:.4f}", flush=True)
-    best_model = xgb.XGBClassifier(**study.best_params, objective=obj, tree_method='hist')
+    best_model = xgb.XGBClassifier(**study.best_params, objective='multi:softprob', tree_method='hist')
     sw_full = get_balanced_weights(y)
     best_model.fit(X, y, sample_weight=sw_full)
     return best_model
@@ -104,12 +98,16 @@ def train_ensemble(args=None):
         print(f"Macro Dataset: {macro_file}", flush=True)
     optuna_trials = args.optuna_trials if args and hasattr(args, "optuna_trials") else 0
     print(f"Model Engine : XGBoost (Optuna Trials: {optuna_trials})", flush=True)
+    print(f"Features used: 5 Technical + 4 Macro (9 total)", flush=True)
     print("========================================================\n", flush=True)
     
+
     dataset_path = os.path.join(base_dir, "dataset", dataset_file)
+    
     model_name_base = args.model_name if args and hasattr(args, 'model_name') and args.model_name else "xgboost"
     engine_models_dir = os.path.join(os.path.dirname(base_dir), "quant-engine-v1", "ml_models")
 
+    
     if not os.path.exists(dataset_path):
         logger.error(f"Dataset not found at {dataset_path}")
         return
@@ -134,87 +132,55 @@ def train_ensemble(args=None):
         else:
             logger.warning(f"Macro dataset not found at {macro_path}. Macro Expert will fall back.")
             
-    # On-the-fly feature calculation for stationary & missing features (Tasks 5 & 6)
-    if 'return_1' not in df.columns: df['return_1'] = df['close'].pct_change(1) * 100
-    if 'return_24h' not in df.columns: df['return_24h'] = df['close'].pct_change(24) * 100
-    if 'realized_vol_20' not in df.columns: df['realized_vol_20'] = df['return_1'].rolling(20).std()
-    if 'session_id' not in df.columns:
-        time_s = pd.to_datetime(df.index)
-        df['session_id'] = pd.cut(time_s.hour, bins=[0, 8, 13, 21, 24], labels=[0, 1, 2, 3], right=False, include_lowest=True).astype(float)
-    if 'tips_10y' in df.columns and 'tips_zscore_20d' not in df.columns:
-        df['tips_zscore_20d'] = (df['tips_10y'] - df['tips_10y'].rolling(20).mean()) / df['tips_10y'].rolling(20).std().replace(0, 1)
-    if 'fed_rate' in df.columns and 'fed_rate_change_20d' not in df.columns:
-        df['fed_rate_change_20d'] = df['fed_rate'].diff(20)
-    if 'vix' in df.columns and 'vix_zscore_20d' not in df.columns:
-        df['vix_zscore_20d'] = (df['vix'] - df['vix'].rolling(20).mean()) / df['vix'].rolling(20).std().replace(0, 1)
-        
     df = df.dropna().copy()
     df = create_target(df)
     
-    # Define Specialized Feature Sets for MoE (Task 4)
-    trend_cols = [
-        'adx', 'macd_diff', 'dist_ema_50', 'dist_ema_9', 'kc_position', 'adx_slope_5',
-        'volume_ratio', 'return_1', 'return_24h', 'realized_vol_20',
-        'tips_10y_chg_5d', 'dxy_broad_return_5d', 'hour_sin', 'hour_cos', 'session_id'
-    ]
-    meanrev_cols = [
-        'rsi_14', 'bb_width', 'bb_position', 'atr_pct', 'rsi_slope_5', 'cci',
-        'return_1', 'realized_vol_20', 'volume_ratio', 'vix_zscore_20d',
-        'hour_sin', 'hour_cos', 'session_id'
-    ]
-    macro_cols = [
-        'tips_10y_chg_5d', 'tips_zscore_20d', 'dxy_broad_return_5d', 'vix_chg_1d', 'vix_zscore_20d',
-        'yield_spread_10y_2y', 'fed_rate_change_20d', 'return_24h', 'realized_vol_20',
-        'dist_ema_50', 'adx', 'session_id'
-    ]
+    # Feature Selection
+    tech_features = ['adx', 'rsi', 'macd', 'bb_width', 'dist_ema_50']
+    macro_features = [f for f in df.columns if f in ['tips_10y_level', 'dxy_broad_return_5d', 'vix_level', 'fed_rate_level']]
     
-    trend_features = [f for f in trend_cols if f in df.columns]
-    meanrev_features = [f for f in meanrev_cols if f in df.columns]
-    macro_features = [f for f in macro_cols if f in df.columns]
-    
-    all_features_to_use = sorted(list(set(trend_features + meanrev_features + macro_features)))
-    print(f"Specialized MoE Features: Trend={len(trend_features)}, MeanRev={len(meanrev_features)}, Macro={len(macro_features)} (Total Unique={len(all_features_to_use)})", flush=True)
+    # Missing features fallback
+    features_to_use = [f for f in tech_features + macro_features if f in df.columns]
     
     # 1. Train Trend Expert (ADX > 25)
     print("PROGRESS: 25% - Training Trend Expert (ADX > 25)...")
     logger.info("Training Trend Expert...")
     df_trend = df[df['adx'] > 25].copy() if 'adx' in df.columns else df.copy()
-    X_trend = df_trend[trend_features].values
+    X_trend = df_trend[features_to_use].values
     y_trend = df_trend['target_direction'].values
     
     model_trend = optimize_and_train_xgb(X_trend, y_trend, optuna_trials, "Trend Expert")
     name_trend = f"{model_name_base}_trend"
-    uses_meta = (args.use_meta == "1") if args and hasattr(args, 'use_meta') else True
-    save_onnx_model(model_trend, trend_features, os.path.join(engine_models_dir, "trend", f"{name_trend}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_trend, features_to_use, os.path.join(engine_models_dir, "trend", f"{name_trend}.onnx"), uses_meta=(args.use_meta == "1") if args and hasattr(args, 'use_meta') else True)
     
     # 2. Train MeanRev Expert (ADX <= 25)
     print("PROGRESS: 50% - Training MeanRev Expert (ADX <= 25)...")
     logger.info("Training MeanRev Expert...")
     df_meanrev = df[df['adx'] <= 25].copy() if 'adx' in df.columns else df.copy()
-    X_meanrev = df_meanrev[meanrev_features].values
+    X_meanrev = df_meanrev[features_to_use].values
     y_meanrev = df_meanrev['target_direction'].values
     
     model_meanrev = optimize_and_train_xgb(X_meanrev, y_meanrev, optuna_trials, "MeanRev Expert")
     name_meanrev = f"{model_name_base}_meanrev"
-    save_onnx_model(model_meanrev, meanrev_features, os.path.join(engine_models_dir, "meanrev", f"{name_meanrev}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_meanrev, features_to_use, os.path.join(engine_models_dir, "meanrev", f"{name_meanrev}.onnx"), uses_meta=(args.use_meta == "1") if args and hasattr(args, 'use_meta') else True)
     
     # 3. Train Macro Expert
     print("PROGRESS: 70% - Training Macro Expert...")
     logger.info("Training Macro Expert...")
-    X_macro = df[macro_features].values
+    X_macro = df[features_to_use].values
     y_macro = df['target_direction'].values
     
     model_macro = optimize_and_train_xgb(X_macro, y_macro, optuna_trials, "Macro Expert")
     name_macro = f"{model_name_base}_macro"
-    save_onnx_model(model_macro, macro_features, os.path.join(engine_models_dir, "macro", f"{name_macro}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_macro, features_to_use, os.path.join(engine_models_dir, "macro", f"{name_macro}.onnx"), uses_meta=(args.use_meta == "1") if args and hasattr(args, 'use_meta') else True)
     
     # 4. Train Gating & Meta Learner on Full Dataset
     print("PROGRESS: 85% - Generating OOF Predictions & Training Gating/Meta...")
     logger.info("Generating OOF predictions for Meta & Gating training to prevent data leakage...")
+    X_full = df[features_to_use].values
     
-    from sklearn.model_selection import TimeSeriesSplit
-    tscv = TimeSeriesSplit(n_splits=5, gap=5)
-    oof_mask = np.zeros(len(df), dtype=bool)
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=5, shuffle=False)
     
     oof_probs_trend = np.full((len(df), 3), 0.33)
     oof_probs_meanrev = np.full((len(df), 3), 0.33)
@@ -223,26 +189,22 @@ def train_ensemble(args=None):
     adx_val = df['adx'].values if 'adx' in df.columns else np.full(len(df), 30)
     y_true = df['target_direction'].values
 
-    X_trend_full = df[trend_features].values
-    X_meanrev_full = df[meanrev_features].values
-    X_macro_full = df[macro_features].values
-
-    for train_idx, val_idx in tscv.split(df):
-        oof_mask[val_idx] = True
+    
+    for train_idx, val_idx in kf.split(X_full):
         tr_trend_idx = train_idx[adx_val[train_idx] > 25]
         if len(tr_trend_idx) > 0:
-            m_t = optimize_and_train_xgb(X_trend_full[tr_trend_idx], y_true[tr_trend_idx], 0, "OOF Trend")
-            oof_probs_trend[val_idx] = m_t.predict_proba(X_trend_full[val_idx])
+            m_t = optimize_and_train_xgb(X_full[tr_trend_idx], y_true[tr_trend_idx], 0, "OOF Trend")
+            oof_probs_trend[val_idx] = m_t.predict_proba(X_full[val_idx])
             
         tr_meanrev_idx = train_idx[adx_val[train_idx] <= 25]
         if len(tr_meanrev_idx) > 0:
-            m_m = optimize_and_train_xgb(X_meanrev_full[tr_meanrev_idx], y_true[tr_meanrev_idx], 0, "OOF MeanRev")
-            oof_probs_meanrev[val_idx] = m_m.predict_proba(X_meanrev_full[val_idx])
+            m_m = optimize_and_train_xgb(X_full[tr_meanrev_idx], y_true[tr_meanrev_idx], 0, "OOF MeanRev")
+            oof_probs_meanrev[val_idx] = m_m.predict_proba(X_full[val_idx])
             
-        m_ma = optimize_and_train_xgb(X_macro_full[train_idx], y_true[train_idx], 0, "OOF Macro")
-        oof_probs_macro[val_idx] = m_ma.predict_proba(X_macro_full[val_idx])
+        m_ma = optimize_and_train_xgb(X_full[train_idx], y_true[train_idx], 0, "OOF Macro")
+        oof_probs_macro[val_idx] = m_ma.predict_proba(X_full[val_idx])
     
-    # Gating Network inputs
+    # Gating Network inputs: [hmm_0, hmm_1, hmm_2, hmm_3, adx, vix, bb_width]
     gating_features = []
     if 'adx' in df.columns: gating_features.append('adx')
     if 'vix_level' in df.columns: gating_features.append('vix_level')
@@ -256,12 +218,10 @@ def train_ensemble(args=None):
         try:
             hmm_data = joblib.load(hmm_path)
             hmm_model = hmm_data['model']
-            hmm_scaler = hmm_data.get('scaler', None)
             hmm_feat_names = hmm_data['features']
             X_hmm = df[hmm_feat_names].values
-            if hmm_scaler is not None:
-                X_hmm = hmm_scaler.transform(X_hmm)
             
+            # Simulate 10-bar buffer to match live engine and prevent lookahead bias
             hmm_probs_list = []
             for i in range(len(X_hmm)):
                 start_idx = max(0, i - 9)
@@ -269,96 +229,58 @@ def train_ensemble(args=None):
                 probs_seq = hmm_model.predict_proba(X_seq)
                 hmm_probs_list.append(probs_seq[-1])
             hmm_features = np.array(hmm_probs_list)
+            
         except Exception as e:
             logger.warning(f"Failed to generate HMM features for gating: {e}")
             
     X_gating = np.hstack([hmm_features, X_gating_base])
     
-    # Create domain-specialized accuracy gating labels
-    # Label = expert that assigned highest probability to the actual true outcome, with domain priors
+    # Create profitability-based gating labels
+    # Label = expert that yielded the highest expected return for that bar
     y_gating = []
-    adx_arr = df['adx'].values if 'adx' in df.columns else np.full(len(df), 20.0)
-    vix_arr = df['vix_level'].values if 'vix_level' in df.columns else np.full(len(df), 15.0)
-    
+    future_ret = df['future_return'].values
     for i in range(len(df)):
-        true_lbl = int(y_true[i])
-        p_trend = oof_probs_trend[i][true_lbl]
-        p_meanrev = oof_probs_meanrev[i][true_lbl]
-        p_macro = oof_probs_macro[i][true_lbl]
+        # Calculate Expected Return for each expert = (Prob(BUY) - Prob(SELL)) * Future_Return
+        er_trend = (oof_probs_trend[i][2] - oof_probs_trend[i][0]) * future_ret[i]
+        er_meanrev = (oof_probs_meanrev[i][2] - oof_probs_meanrev[i][0]) * future_ret[i]
+        er_macro = (oof_probs_macro[i][2] - oof_probs_macro[i][0]) * future_ret[i]
         
-        # Clean domain regime labeling without HMM state distortion:
-        # 1. Volatility Crisis / High VIX -> Macro Expert (2)
-        # 2. Strong Trending market (ADX > 26) -> Trend Expert (0)
-        # 3. Ranging / Consolidation market (ADX < 22) -> MeanRev Expert (1)
-        # 4. Transition zone (22 <= ADX <= 26) -> Best predicting expert
-        if vix_arr[i] > 23.0:
-            best_exp = 2 # Macro Expert
-        elif adx_arr[i] > 26.0:
-            best_exp = 0 # Trend Expert
-        elif adx_arr[i] < 22.0:
-            best_exp = 1 # MeanRev Expert
-        else:
-            best_exp = int(np.argmax([p_trend, p_meanrev, p_macro]))
+        best_exp = np.argmax([er_trend, er_meanrev, er_macro])
         y_gating.append(best_exp)
         
-    y_gating_arr = np.array(y_gating)
     gating_model = xgb.XGBClassifier(objective='multi:softprob', max_depth=3, learning_rate=0.05, n_estimators=100, tree_method='hist')
-    sw_gating = get_balanced_weights(y_gating_arr[oof_mask])
-    gating_model.fit(X_gating[oof_mask], y_gating_arr[oof_mask], sample_weight=sw_gating)
+    sw_gating = get_balanced_weights(y_gating)
+    gating_model.fit(X_gating, y_gating, sample_weight=sw_gating)
     
-    if uses_meta:
-        print("PROGRESS: 90% - Training Meta Learners for each Expert...")
-        
-        def train_and_save_meta(oof_probs, expert_name, save_folder, save_name, feat_list, X_feat_full):
-            conf = np.max(oof_probs, axis=1)
-            pred_classes = np.argmax(oof_probs, axis=1)
-            
-            # CRITICAL FIX: Only train Meta-Learner on NON-NEUTRAL predictions (BUY or SELL) from strictly OOF slices.
-            active_idx = np.where((pred_classes != 1) & oof_mask)[0]
-            
-            if len(active_idx) < 10:
-                logger.warning(f"Not enough active trades to train Meta Learner for {expert_name}. Falling back to all OOF rows.")
-                active_idx = np.where(oof_mask)[0]
-                
-            X_meta_active = np.hstack([X_feat_full[active_idx], conf[active_idx].reshape(-1, 1)])
-            y_meta_active = (pred_classes[active_idx] == y_true[active_idx]).astype(int)
-            meta_features_names = feat_list + ["primary_confidence"]
-            
-            meta_model = optimize_and_train_xgb(X_meta_active, y_meta_active, 0, f"Meta {expert_name}")
-            save_onnx_model(meta_model, meta_features_names, os.path.join(engine_models_dir, save_folder, f"{save_name}_meta.onnx"), uses_meta=False)
-
-        train_and_save_meta(oof_probs_trend, "Trend", "trend", name_trend, trend_features, X_trend_full)
-        train_and_save_meta(oof_probs_meanrev, "MeanRev", "meanrev", name_meanrev, meanrev_features, X_meanrev_full)
-        train_and_save_meta(oof_probs_macro, "Macro", "macro", name_macro, macro_features, X_macro_full)
-        
-        # Train Ensemble Meta-Learner (Combiner)
-        print("PROGRESS: 92% - Training Ensemble Meta-Learner...")
-        X_meta_ensemble = np.hstack([oof_probs_trend, oof_probs_meanrev, oof_probs_macro])
-        ensemble_meta_model = LogisticRegression(max_iter=1000, class_weight='balanced')
-        ensemble_meta_model.fit(X_meta_ensemble[oof_mask], y_true[oof_mask])
-        
-        ensemble_dir = os.path.join(engine_models_dir, "ensemble")
-        os.makedirs(ensemble_dir, exist_ok=True)
-        name_controller = f"{model_name_base}_ensemble"
-        joblib.dump(ensemble_meta_model, os.path.join(ensemble_dir, f"{name_controller}_meta_learner.pkl"))
+    # Meta Learner inputs: 9 OOF probabilities
+    X_meta = np.hstack([oof_probs_trend, oof_probs_meanrev, oof_probs_macro])
+    meta_model = xgb.XGBClassifier(objective='multi:softprob', max_depth=3, learning_rate=0.05, n_estimators=100, tree_method='hist')
+    sw_meta = get_balanced_weights(y_true)
+    meta_model.fit(X_meta, y_true, sample_weight=sw_meta)
     
-    # Calculate Accuracies (using strictly OOF predictions for realistic metrics)
+    # Calculate Accuracies (using OOF predictions for realistic metrics)
     from sklearn.metrics import accuracy_score
-    acc_trend = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_trend[oof_mask], axis=1))
-    acc_meanrev = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_meanrev[oof_mask], axis=1))
-    acc_macro = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_macro[oof_mask], axis=1))
-    acc_ensemble = accuracy_score(y_gating_arr[oof_mask], gating_model.predict(X_gating[oof_mask]))
+    acc_trend = accuracy_score(y_true, np.argmax(oof_probs_trend, axis=1))
+    acc_meanrev = accuracy_score(y_true, np.argmax(oof_probs_meanrev, axis=1))
+    acc_macro = accuracy_score(y_true, np.argmax(oof_probs_macro, axis=1))
+    acc_meta = accuracy_score(y_true, meta_model.predict(X_meta))
     
-    # Export Gating Network
+    # Export Gating and Meta
     ensemble_dir = os.path.join(engine_models_dir, "ensemble")
     os.makedirs(ensemble_dir, exist_ok=True)
+    
     name_controller = f"{model_name_base}_ensemble"
     joblib.dump(gating_model, os.path.join(ensemble_dir, f"{name_controller}_gating_network.pkl"))
+    
+    uses_meta = (args.use_meta == "1") if args and hasattr(args, 'use_meta') else True
+    if uses_meta:
+        joblib.dump(meta_model, os.path.join(ensemble_dir, f"{name_controller}_meta_learner.pkl"))
     
     print("PROGRESS: 95% - Registering trained experts to database...")
     logger.info("Registering trained models to Engine Database...")
     try:
         import requests
+        import time
         from datetime import datetime
         now_str = datetime.utcnow().isoformat()
         
@@ -366,7 +288,7 @@ def train_ensemble(args=None):
             {"name": name_trend, "regime": "TREND_EXPERT", "accuracy": f"{acc_trend*100:.2f}%", "folder": "trend"},
             {"name": name_meanrev, "regime": "MEANREV_EXPERT", "accuracy": f"{acc_meanrev*100:.2f}%", "folder": "meanrev"},
             {"name": name_macro, "regime": "MACRO_EXPERT", "accuracy": f"{acc_macro*100:.2f}%", "folder": "macro"},
-            {"name": name_controller, "regime": "MOE_ENSEMBLE", "accuracy": f"{acc_ensemble*100:.2f}%", "folder": "ensemble"}
+            {"name": name_controller, "regime": "MOE_ENSEMBLE", "accuracy": f"{acc_meta*100:.2f}%", "folder": "ensemble"}
         ]
         for exp in experts:
             meta_json_str = None
@@ -380,13 +302,13 @@ def train_ensemble(args=None):
                     
             payload = {
                 "name": exp["name"],
-                "algorithm_type": "XGBoost MoE Expert" if "expert" in exp["name"] else "MoE Gating Network",
+                "algorithm_type": "XGBoost MoE Expert" if "expert" in exp["name"] else "MoE Gating & Meta",
                 "accuracy": exp["accuracy"],
                 "status": "Active",
                 "train_start_time": now_str,
                 "train_duration_sec": "15",
                 "regime": exp["regime"],
-                "uses_meta": uses_meta
+                "uses_meta": (args.use_meta == "1") if args and hasattr(args, 'use_meta') else True
             }
             if meta_json_str is not None:
                 payload["metadata"] = meta_json_str
