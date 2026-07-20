@@ -21,8 +21,8 @@ def create_target(df):
     future_ret = df['close'].shift(-5) / df['close'] - 1
     
     target = np.ones(len(df)) # Default NEUTRAL
-    target[future_ret > 0.0035] = 2 # BUY (> 0.35%)
-    target[future_ret < -0.0035] = 0 # SELL (< -0.35%)
+    target[future_ret > 0.002] = 2 # BUY (> 0.2%)
+    target[future_ret < -0.002] = 0 # SELL (< -0.2%)
     
     df['target_direction'] = target
     df['future_return'] = future_ret
@@ -39,8 +39,7 @@ def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
     obj = 'multi:softprob' if num_classes > 2 else 'binary:logistic'
     if n_trials <= 0:
         model = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, objective=obj, tree_method='hist')
-        sw = get_balanced_weights(y)
-        model.fit(X, y, sample_weight=sw)
+        model.fit(X, y)
         return model
 
     import optuna
@@ -58,11 +57,17 @@ def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
             'tree_method': 'hist' # Prevent bad allocation with large weights
         }
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
+        
         sw_train = get_balanced_weights(y_train)
+        sw_val = get_balanced_weights(y_val)
         
         model = xgb.XGBClassifier(**params)
         model.fit(X_train, y_train, sample_weight=sw_train)
-        return model.score(X_val, y_val)
+        
+        # Use negative unweighted log_loss so Optuna balances raw accuracy
+        from sklearn.metrics import log_loss
+        y_prob = model.predict_proba(X_val)
+        return -log_loss(y_val, y_prob)
         
     print(f"Running Optuna tuning for {prefix} ({n_trials} trials)...", flush=True)
     study = optuna.create_study(direction='maximize')
@@ -70,11 +75,10 @@ def optimize_and_train_xgb(X, y, n_trials=10, prefix=""):
     
     print(f"[{prefix}] Best params: {study.best_params} | Best Score: {study.best_value:.4f}", flush=True)
     best_model = xgb.XGBClassifier(**study.best_params, objective=obj, tree_method='hist')
-    sw_full = get_balanced_weights(y)
-    best_model.fit(X, y, sample_weight=sw_full)
+    best_model.fit(X, y)
     return best_model
 
-def save_onnx_model(xgb_model, feature_names, save_path, uses_meta=False):
+def save_onnx_model(xgb_model, feature_names, save_path, uses_meta=False, X_train=None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     initial_type = [('float_input', FloatTensorType([None, len(feature_names)]))]
     onnx_model = convert_xgboost(xgb_model, initial_types=initial_type)
@@ -82,11 +86,26 @@ def save_onnx_model(xgb_model, feature_names, save_path, uses_meta=False):
     with open(save_path, "wb") as f:
         f.write(onnx_model.SerializeToString())
         
+    # Compute baseline stats from training data
+    baseline_stats = {}
+    if X_train is not None:
+        import numpy as np
+        for i, feat in enumerate(feature_names):
+            try:
+                col = X_train[:, i] if isinstance(X_train, np.ndarray) else X_train[feat].values
+                baseline_stats[feat] = {
+                    "mean": float(np.nanmean(col)),
+                    "std": float(max(np.nanstd(col), 1e-8))  # floor to prevent div/0
+                }
+            except Exception:
+                pass
+
     # Save metadata
     meta = {
         "features": feature_names,
         "classes": {0: "SELL", 1: "NEUTRAL", 2: "BUY"},
-        "uses_meta": uses_meta
+        "uses_meta": uses_meta,
+        "baseline_stats": baseline_stats
     }
     meta_path = save_path.replace(".onnx", "_metadata.json")
     with open(meta_path, "w") as f:
@@ -151,21 +170,25 @@ def train_ensemble(args=None):
     df = df.dropna().copy()
     df = create_target(df)
     
-    # Define Specialized Feature Sets for MoE (Task 4)
-    trend_cols = [
-        'adx', 'macd_diff', 'dist_ema_50', 'dist_ema_9', 'kc_position', 'adx_slope_5',
-        'volume_ratio', 'return_1', 'return_24h', 'realized_vol_20',
-        'tips_10y_chg_5d', 'dxy_broad_return_5d', 'hour_sin', 'hour_cos', 'session_id'
+    # 1. Core Features (Golden Era + H1 Liquidity/Time Filters)
+    core_features = [
+        'adx', 'rsi_14', 'macd_diff', 'bb_width', 'dist_ema_50',
+        'hour_sin', 'hour_cos', 'atr_pct', 'volume'
     ]
-    meanrev_cols = [
-        'rsi_14', 'bb_width', 'bb_position', 'atr_pct', 'rsi_slope_5', 'cci',
-        'return_1', 'realized_vol_20', 'volume_ratio', 'vix_zscore_20d',
-        'hour_sin', 'hour_cos', 'session_id'
+    
+    # 2. Trend Expert (H1 Swing & Momentum Breakout)
+    trend_cols = core_features + [
+        'dist_ema_200', 'ema_cross_9_21', 'obv'
     ]
-    macro_cols = [
-        'tips_10y_chg_5d', 'tips_zscore_20d', 'dxy_broad_return_5d', 'vix_chg_1d', 'vix_zscore_20d',
-        'yield_spread_10y_2y', 'fed_rate_change_20d', 'return_24h', 'realized_vol_20',
-        'dist_ema_50', 'adx', 'session_id'
+    
+    # 3. MeanRev Expert (H1 Boundaries & Reversals)
+    meanrev_cols = core_features + [
+        'cci', 'bb_position', 'ema_cross_21_50'
+    ]
+    
+    # 4. Macro Expert (Intermarket Context for H1)
+    macro_cols = core_features + [
+        'dxym_dist_ema_50', 'usoilm_dist_ema_50', 'tips_10y_chg_5d', 'fed_rate_level', 'vix_zscore_20d'
     ]
     
     trend_features = [f for f in trend_cols if f in df.columns]
@@ -185,7 +208,7 @@ def train_ensemble(args=None):
     model_trend = optimize_and_train_xgb(X_trend, y_trend, optuna_trials, "Trend Expert")
     name_trend = f"{model_name_base}_trend"
     uses_meta = (args.use_meta == "1") if args and hasattr(args, 'use_meta') else True
-    save_onnx_model(model_trend, trend_features, os.path.join(engine_models_dir, "trend", f"{name_trend}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_trend, trend_features, os.path.join(engine_models_dir, "trend", f"{name_trend}.onnx"), uses_meta=uses_meta, X_train=X_trend)
     
     # 2. Train MeanRev Expert (ADX <= 25)
     print("PROGRESS: 50% - Training MeanRev Expert (ADX <= 25)...")
@@ -196,7 +219,7 @@ def train_ensemble(args=None):
     
     model_meanrev = optimize_and_train_xgb(X_meanrev, y_meanrev, optuna_trials, "MeanRev Expert")
     name_meanrev = f"{model_name_base}_meanrev"
-    save_onnx_model(model_meanrev, meanrev_features, os.path.join(engine_models_dir, "meanrev", f"{name_meanrev}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_meanrev, meanrev_features, os.path.join(engine_models_dir, "meanrev", f"{name_meanrev}.onnx"), uses_meta=uses_meta, X_train=X_meanrev)
     
     # 3. Train Macro Expert
     print("PROGRESS: 70% - Training Macro Expert...")
@@ -206,7 +229,7 @@ def train_ensemble(args=None):
     
     model_macro = optimize_and_train_xgb(X_macro, y_macro, optuna_trials, "Macro Expert")
     name_macro = f"{model_name_base}_macro"
-    save_onnx_model(model_macro, macro_features, os.path.join(engine_models_dir, "macro", f"{name_macro}.onnx"), uses_meta=uses_meta)
+    save_onnx_model(model_macro, macro_features, os.path.join(engine_models_dir, "macro", f"{name_macro}.onnx"), uses_meta=uses_meta, X_train=X_macro)
     
     # 4. Train Gating & Meta Learner on Full Dataset
     print("PROGRESS: 85% - Generating OOF Predictions & Training Gating/Meta...")
@@ -325,7 +348,7 @@ def train_ensemble(args=None):
             meta_features_names = feat_list + ["primary_confidence"]
             
             meta_model = optimize_and_train_xgb(X_meta_active, y_meta_active, 0, f"Meta {expert_name}")
-            save_onnx_model(meta_model, meta_features_names, os.path.join(engine_models_dir, save_folder, f"{save_name}_meta.onnx"), uses_meta=False)
+            save_onnx_model(meta_model, meta_features_names, os.path.join(engine_models_dir, save_folder, f"{save_name}_meta.onnx"), uses_meta=False, X_train=X_meta_active)
 
         train_and_save_meta(oof_probs_trend, "Trend", "trend", name_trend, trend_features, X_trend_full)
         train_and_save_meta(oof_probs_meanrev, "MeanRev", "meanrev", name_meanrev, meanrev_features, X_meanrev_full)
@@ -334,7 +357,7 @@ def train_ensemble(args=None):
         # Train Ensemble Meta-Learner (Combiner)
         print("PROGRESS: 92% - Training Ensemble Meta-Learner...")
         X_meta_ensemble = np.hstack([oof_probs_trend, oof_probs_meanrev, oof_probs_macro])
-        ensemble_meta_model = LogisticRegression(max_iter=1000, class_weight='balanced')
+        ensemble_meta_model = LogisticRegression(max_iter=1000)
         ensemble_meta_model.fit(X_meta_ensemble[oof_mask], y_true[oof_mask])
         
         ensemble_dir = os.path.join(engine_models_dir, "ensemble")
