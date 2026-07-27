@@ -114,8 +114,8 @@ def save_onnx_model(xgb_model, feature_names, save_path, uses_meta=False, X_trai
 def train_ensemble(args=None):
     logger.info("Starting MoE Ensemble Training Pipeline...")
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    dataset_file = args.dataset_file if args and hasattr(args, 'dataset_file') and args.dataset_file else "XAUUSD_DEFAULT.csv"
-    macro_file = args.macro_file if args and hasattr(args, 'macro_file') and args.macro_file else None
+    dataset_file = args.dataset_file if args and hasattr(args, 'dataset_file') and args.dataset_file else "XAUUSD_TECHNICAL.csv"
+    macro_file = args.macro_file if args and hasattr(args, 'macro_file') and args.macro_file else "XAUUSD_MACRO.csv"
     
     print("\n================ TRAINING CONFIGURATION ================", flush=True)
     print(f"Base Dataset : {dataset_file}", flush=True)
@@ -365,10 +365,13 @@ def train_ensemble(args=None):
         name_controller = f"{model_name_base}_ensemble"
         joblib.dump(ensemble_meta_model, os.path.join(ensemble_dir, f"{name_controller}_meta_learner.pkl"))
     
-    # Calculate Accuracies (using strictly OOF predictions for realistic metrics)
+    # Calculate Accuracies (using domain regime subset on OOF predictions for realistic metrics)
     from sklearn.metrics import accuracy_score
-    acc_trend = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_trend[oof_mask], axis=1))
-    acc_meanrev = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_meanrev[oof_mask], axis=1))
+    trend_mask = oof_mask & (adx_val > 25)
+    meanrev_mask = oof_mask & (adx_val <= 25)
+    
+    acc_trend = accuracy_score(y_true[trend_mask], np.argmax(oof_probs_trend[trend_mask], axis=1)) if np.sum(trend_mask) > 0 else 0.50
+    acc_meanrev = accuracy_score(y_true[meanrev_mask], np.argmax(oof_probs_meanrev[meanrev_mask], axis=1)) if np.sum(meanrev_mask) > 0 else 0.50
     acc_macro = accuracy_score(y_true[oof_mask], np.argmax(oof_probs_macro[oof_mask], axis=1))
     acc_ensemble = accuracy_score(y_gating_arr[oof_mask], gating_model.predict(X_gating[oof_mask]))
     
@@ -428,8 +431,8 @@ def train_ensemble(args=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_file", type=str, default="XAUUSD_DEFAULT.csv")
-    parser.add_argument("--macro_file", type=str, default=None)
+    parser.add_argument("--dataset_file", type=str, default="XAUUSD_TECHNICAL.csv")
+    parser.add_argument("--macro_file", type=str, default="XAUUSD_MACRO.csv")
     parser.add_argument("--optuna_trials", type=int, default=10)
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument("--use_meta", type=str, default="1")
